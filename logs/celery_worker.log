@@ -1,0 +1,4 @@
+[2026-05-27 08:20:24,293: INFO/MainProcess] Connected to redis://127.0.0.1:6379/0
+[2026-05-27 08:20:24,296: INFO/MainProcess] mingle: searching for neighbors
+[2026-05-27 08:20:25,301: INFO/MainProcess] mingle: all alone
+[2026-05-27 08:20:25,307: INFO/MainProcess] celery@edgar-Inspiron-15-3535 ready.

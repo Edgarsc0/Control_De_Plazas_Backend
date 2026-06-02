@@ -1,0 +1,119 @@
+{
+  "gemini-3.1-flash-lite": {
+    "daily": {
+      "2026-05-29": {
+        "requests": 13,
+        "prompt_tokens": 180392,
+        "output_tokens": 2084,
+        "thought_tokens": 0,
+        "total_tokens": 182476
+      }
+    },
+    "hourly": {
+      "2026-05-29T14": {
+        "requests": 7,
+        "total_tokens": 101152
+      },
+      "2026-05-29T15": {
+        "requests": 2,
+        "total_tokens": 19840
+      },
+      "2026-05-29T16": {
+        "requests": 4,
+        "total_tokens": 61484
+      }
+    }
+  },
+  "gemini-2.5-flash-preview-05-20": {
+    "daily": {
+      "2026-05-29": {
+        "requests": 1,
+        "prompt_tokens": 0,
+        "output_tokens": 0,
+        "thought_tokens": 0,
+        "total_tokens": 0
+      }
+    },
+    "hourly": {
+      "2026-05-29T15": {
+        "requests": 1,
+        "total_tokens": 0
+      }
+    }
+  },
+  "gemini-2.5-flash": {
+    "daily": {
+      "2026-05-29": {
+        "requests": 2,
+        "prompt_tokens": 160733,
+        "output_tokens": 1059,
+        "thought_tokens": 1119,
+        "total_tokens": 162911
+      },
+      "2026-05-30": {
+        "requests": 2,
+        "prompt_tokens": 122921,
+        "output_tokens": 767,
+        "thought_tokens": 1618,
+        "total_tokens": 125306
+      }
+    },
+    "hourly": {
+      "2026-05-29T15": {
+        "requests": 2,
+        "total_tokens": 162911
+      },
+      "2026-05-30T01": {
+        "requests": 1,
+        "total_tokens": 38703
+      },
+      "2026-05-30T02": {
+        "requests": 1,
+        "total_tokens": 86603
+      }
+    }
+  },
+  "gemini-3.5-flash": {
+    "daily": {
+      "2026-05-29": {
+        "requests": 4,
+        "prompt_tokens": 242676,
+        "output_tokens": 3752,
+        "thought_tokens": 8928,
+        "total_tokens": 255356
+      },
+      "2026-05-30": {
+        "requests": 4,
+        "prompt_tokens": 101829,
+        "output_tokens": 2875,
+        "thought_tokens": 3057,
+        "total_tokens": 107761
+      },
+      "2026-06-01": {
+        "requests": 1,
+        "prompt_tokens": 18295,
+        "output_tokens": 15,
+        "thought_tokens": 222,
+        "total_tokens": 18532
+      }
+    },
+    "hourly": {
+      "2026-05-29T15": {
+        "requests": 1,
+        "total_tokens": 63047
+      },
+      "2026-05-29T16": {
+        "requests": 3,
+        "total_tokens": 192309
+      },
+      "2026-05-30T01": {
+        "requests": 4,
+        "total_tokens": 107761
+      },
+      "2026-06-01T22": {
+        "requests": 1,
+        "total_tokens": 18532
+      }
+    }
+  }
+}
