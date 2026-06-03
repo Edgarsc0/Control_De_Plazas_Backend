@@ -1458,35 +1458,60 @@ class TorreCaballitoEmpleadosView(APIView):
         piso = request.query_params.get('piso', None)
         ua = request.query_params.get('ua', None)
         
-        if not piso or not ua:
-            return Response({"error": "Faltan parametros piso y ua"}, status=400)
+        if not piso:
+            return Response({"error": "Falta el parametro piso"}, status=400)
             
         from django.db import connection
-        query = '''
-            SELECT 
-                e.`Posición`,
-                e.`Numempleado`,
-                e.`Nombres`,
-                e.`Unidad Administrativa`,
-                e.`Descripción ubicación`,
-                e.`Estado Nómina`
-            FROM EMPLEADOS_COMPLETOS_SIG e
-            INNER JOIN (
-                SELECT `Nº Pos Actual` FROM (
-                    SELECT `Nº Pos Actual`, `Estado Psn`, ROW_NUMBER() OVER (
-                        PARTITION BY `Nº Pos Actual` 
-                        ORDER BY `F Efva` DESC, `Fecha Captura` DESC, `F/H Últ Actz` DESC, id DESC
-                    ) as rn
-                    FROM MOV_POS
-                ) ranked WHERE rn = 1 AND `Estado Psn` = 'A'
-            ) activas ON e.`Posición` = activas.`Nº Pos Actual`
-            WHERE e.`Descripción ubicación` = %s 
-              AND e.`Unidad Administrativa` = %s
-            ORDER BY e.`Nombres`;
-        '''
+        if ua and ua.strip():
+            query = '''
+                SELECT 
+                    e.`Posición`,
+                    e.`Numempleado`,
+                    e.`Nombres`,
+                    e.`Unidad Administrativa`,
+                    e.`Descripción ubicación`,
+                    e.`Estado Nómina`
+                FROM EMPLEADOS_COMPLETOS_SIG e
+                INNER JOIN (
+                    SELECT `Nº Pos Actual` FROM (
+                        SELECT `Nº Pos Actual`, `Estado Psn`, ROW_NUMBER() OVER (
+                            PARTITION BY `Nº Pos Actual` 
+                            ORDER BY `F Efva` DESC, `Fecha Captura` DESC, `F/H Últ Actz` DESC, id DESC
+                        ) as rn
+                        FROM MOV_POS
+                    ) ranked WHERE rn = 1 AND `Estado Psn` = 'A'
+                ) activas ON e.`Posición` = activas.`Nº Pos Actual`
+                WHERE e.`Descripción ubicación` = %s 
+                  AND e.`Unidad Administrativa` = %s
+                ORDER BY e.`Nombres`;
+            '''
+            params = [piso, ua]
+        else:
+            query = '''
+                SELECT 
+                    e.`Posición`,
+                    e.`Numempleado`,
+                    e.`Nombres`,
+                    e.`Unidad Administrativa`,
+                    e.`Descripción ubicación`,
+                    e.`Estado Nómina`
+                FROM EMPLEADOS_COMPLETOS_SIG e
+                INNER JOIN (
+                    SELECT `Nº Pos Actual` FROM (
+                        SELECT `Nº Pos Actual`, `Estado Psn`, ROW_NUMBER() OVER (
+                            PARTITION BY `Nº Pos Actual` 
+                            ORDER BY `F Efva` DESC, `Fecha Captura` DESC, `F/H Últ Actz` DESC, id DESC
+                        ) as rn
+                        FROM MOV_POS
+                    ) ranked WHERE rn = 1 AND `Estado Psn` = 'A'
+                ) activas ON e.`Posición` = activas.`Nº Pos Actual`
+                WHERE e.`Descripción ubicación` = %s 
+                ORDER BY e.`Nombres`;
+            '''
+            params = [piso]
         
         with connection.cursor() as cursor:
-            cursor.execute(query, [piso, ua])
+            cursor.execute(query, params)
             results = cursor.fetchall()
             
         data = []
@@ -1541,8 +1566,8 @@ class TorreCaballitoSearchView(APIView):
             ) activas ON e.`Posición` = activas.`Nº Pos Actual`
             WHERE e.`Descripción ubicación` IS NOT NULL
               AND (
-                  e.`Descripción ubicación` LIKE '%Caballito Reforma 10 P%'
-                  OR e.`Descripción ubicación` LIKE '%Torre Caballito Reforma 10 P%'
+                  e.`Descripción ubicación` LIKE '%%Caballito Reforma 10 P%%'
+                  OR e.`Descripción ubicación` LIKE '%%Torre Caballito Reforma 10 P%%'
               )
               AND (e.`Nombres` LIKE %s OR e.`Numempleado` LIKE %s)
             LIMIT 20;
@@ -1564,3 +1589,146 @@ class TorreCaballitoSearchView(APIView):
                 r['piso_num'] = None
                 
         return Response({"results": results})
+
+
+from rest_framework.pagination import PageNumberPagination
+
+class MovimientosPersonalPagination(PageNumberPagination):
+    page_size = 50
+    page_size_query_param = 'page_size'
+    max_page_size = 10000
+
+class MovimientosPersonalListView(APIView):
+    permission_classes = [IsAuthenticated]
+    pagination_class = MovimientosPersonalPagination
+
+    def get(self, request):
+        from .models import CpTblMovCompleto290526
+        from .serializers import CpTblMovCompleto290526Serializer
+        
+        queryset = CpTblMovCompleto290526.objects.all()
+        
+        # Check if requesting distinct values for a field
+        distinct_field = request.query_params.get('distinct_field', '').strip()
+        
+        # Search query
+        search_query = request.query_params.get('search', '').strip()
+        if search_query:
+            queryset = queryset.filter(
+                Q(posicion__icontains=search_query) |
+                Q(num_empleado__icontains=search_query) |
+                Q(nombre__icontains=search_query) |
+                Q(ap_pat__icontains=search_query) |
+                Q(ap_mat__icontains=search_query) |
+                Q(accion_nombre__icontains=search_query) |
+                Q(motivo_nombre__icontains=search_query) |
+                Q(un_admin__icontains=search_query)
+            )
+
+        # Dynamic Column Filters
+        valid_fields = [f.name for f in CpTblMovCompleto290526._meta.get_fields()]
+        from django.db.models.functions import Trim
+        
+        for param, val in request.query_params.items():
+            if param == 'distinct_field':
+                continue
+            is_exclude = False
+            actual_param = param
+            if param.startswith('exclude__'):
+                is_exclude = True
+                actual_param = param[9:]
+                
+            base_field = actual_param.split('__')[0]
+            
+            # Skip applying filter on the column we are querying distinct values for
+            if distinct_field and base_field == distinct_field:
+                continue
+                
+            if base_field in valid_fields and val:
+                trimmed_field_name = f"trimmed_{base_field}"
+                if trimmed_field_name not in queryset.query.annotations:
+                    queryset = queryset.annotate(**{trimmed_field_name: Trim(base_field)})
+                
+                # Detect lookup suffix if any
+                if '__' in actual_param:
+                    suffix = actual_param.split('__', 1)[1]
+                    actual_param_trimmed = f"{trimmed_field_name}__{suffix}"
+                else:
+                    suffix = None
+                    actual_param_trimmed = trimmed_field_name
+                
+                val_list = [v.strip() for v in val.split(',') if v.strip()]
+                if suffix == 'in' or (not suffix and len(val_list) > 1):
+                    lookup = f"{trimmed_field_name}__in"
+                    if is_exclude:
+                        queryset = queryset.exclude(**{lookup: val_list})
+                    else:
+                        queryset = queryset.filter(**{lookup: val_list})
+                elif suffix:
+                    # Specific suffix (e.g. __istartswith, __iexact, etc.)
+                    if is_exclude:
+                        queryset = queryset.exclude(**{actual_param_trimmed: val_list[0] if len(val_list) == 1 else val_list})
+                    else:
+                        queryset = queryset.filter(**{actual_param_trimmed: val_list[0] if len(val_list) == 1 else val_list})
+                else:
+                    lookup = f"{trimmed_field_name}__icontains"
+                    if is_exclude:
+                        queryset = queryset.exclude(**{lookup: val_list[0]})
+                    else:
+                        queryset = queryset.filter(**{lookup: val_list[0]})
+
+        # If distinct_field requested, return distinct values directly
+        if distinct_field in valid_fields:
+            trimmed_distinct_field = f"trimmed_{distinct_field}"
+            if trimmed_distinct_field not in queryset.query.annotations:
+                queryset = queryset.annotate(**{trimmed_distinct_field: Trim(distinct_field)})
+            
+            # Apply search filter on the distinct field if present
+            distinct_search = request.query_params.get('distinct_search', '').strip()
+            if distinct_search:
+                queryset = queryset.filter(**{f"{trimmed_distinct_field}__icontains": distinct_search})
+            
+            distinct_qs = (
+                queryset.values(trimmed_distinct_field)
+                .annotate(count=Count('*'))
+                .order_by(trimmed_distinct_field)
+            )
+            
+            results = []
+            for item in distinct_qs:
+                val = item[trimmed_distinct_field]
+                results.append({
+                    'value': val if val is not None else '',
+                    'count': item['count']
+                })
+            return Response(results)
+
+        # Sorting
+        sort_by = request.query_params.get('sort_by', '').strip()
+        sort_order = request.query_params.get('sort_order', 'asc').strip().lower()
+        if sort_by in valid_fields:
+            trimmed_sort_field = f"trimmed_{sort_by}"
+            if trimmed_sort_field not in queryset.query.annotations:
+                queryset = queryset.annotate(**{trimmed_sort_field: Trim(sort_by)})
+            if sort_order == 'desc':
+                queryset = queryset.order_by(f"-{trimmed_sort_field}")
+            else:
+                queryset = queryset.order_by(trimmed_sort_field)
+        else:
+            # Default ordering
+            queryset = queryset.order_by('-fecha_efectiva', '-sec')
+
+        # Excel download or full list without pagination
+        no_pagination = request.query_params.get('no_pagination', 'false').strip().lower() == 'true'
+        if no_pagination:
+            serializer = CpTblMovCompleto290526Serializer(queryset, many=True)
+            return Response(serializer.data)
+
+        paginator = self.pagination_class()
+        page = paginator.paginate_queryset(queryset, request, view=self)
+        if page is not None:
+            serializer = CpTblMovCompleto290526Serializer(page, many=True)
+            return paginator.get_paginated_response(serializer.data)
+
+        serializer = CpTblMovCompleto290526Serializer(queryset, many=True)
+        return Response(serializer.data)
