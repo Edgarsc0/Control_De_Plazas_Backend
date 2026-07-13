@@ -6,18 +6,30 @@ import os
 from pathlib import Path
 
 from celery.schedules import crontab
+from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
-
 
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = "django-insecure-cft@qf5e6762e-(&nsu&(hqn543(d"
+try:
+    SECRET_KEY = os.environ["SECRET_KEY"]
+except KeyError:
+    raise ImproperlyConfigured(
+        "La variable de entorno SECRET_KEY es obligatoria (no hay fallback inseguro)."
+    )
 
-DEBUG = True
+DEBUG = os.getenv("DEBUG", "False").strip().lower() == "true"
 
-ALLOWED_HOSTS = ["*"]
+ALLOWED_HOSTS = [
+    h.strip()
+    for h in os.getenv("ALLOWED_HOSTS", "localhost,127.0.0.1").split(",")
+    if h.strip()
+]
+
+# Ruta al repo del frontend, usada para detectar su último commit (ver eje_central_back/views_system.py)
+FRONTEND_REPO_PATH = os.getenv("FRONTEND_REPO_PATH", str(BASE_DIR.parent / "eje_central_front"))
 
 # Application definition
 
@@ -46,6 +58,7 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
     "django.middleware.security.SecurityMiddleware",
+    "django.middleware.gzip.GZipMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -81,8 +94,15 @@ DATABASES = {
         "PASSWORD": os.getenv("DB_PASSWORD"),
         "HOST": os.getenv("DB_HOST", "localhost"),
         "PORT": os.getenv("DB_PORT", "3306"),
+        # Conexiones persistentes: reusa la conexión MySQL entre requests en vez
+        # de abrir/cerrar (handshake) en cada uno.
+        "CONN_MAX_AGE": 60,
+        "CONN_HEALTH_CHECKS": True,
         "OPTIONS": {
             "init_command": "SET sql_mode='STRICT_TRANS_TABLES'",
+            "connect_timeout": 10,
+            "read_timeout": 600,
+            "write_timeout": 600,
         },
     },
     "control_gestion": {
@@ -92,8 +112,38 @@ DATABASES = {
         "PASSWORD": os.getenv("DB_CONTROL_GESTION_PASSWORD"),
         "HOST": os.getenv("DB_CONTROL_GESTION_HOST", "localhost"),
         "PORT": os.getenv("DB_CONTROL_GESTION_PORT", "3306"),
+        "CONN_MAX_AGE": 60,
+        "CONN_HEALTH_CHECKS": True,
         "OPTIONS": {
             "init_command": "SET sql_mode='STRICT_TRANS_TABLES'",
+            "connect_timeout": 10,
+            "read_timeout": 600,
+            "write_timeout": 600,
+        },
+    },
+}
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "simple": {"format": "{levelname} {asctime} {name} {message}", "style": "{"},
+    },
+    "handlers": {
+        "console": {"class": "logging.StreamHandler", "formatter": "simple"},
+    },
+    "root": {"handlers": ["console"], "level": "INFO"},
+    "loggers": {
+        # Evita el ruido de SQL incluso si DEBUG se activa puntualmente.
+        "django.db.backends": {
+            "level": "WARNING",
+            "handlers": ["console"],
+            "propagate": False,
+        },
+        "django.request": {
+            "level": "WARNING",
+            "handlers": ["console"],
+            "propagate": False,
         },
     },
 }
@@ -130,14 +180,32 @@ DATABASE_ROUTERS = ["control_gestion.router.ControlGestionRouter"]
 # CORS configuration
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
+    "http://localhost:3137",
     "http://127.0.0.1:3000",
     "http://192.168.1.76:3000",
+    "http://89.116.51.124:3030",
+]
+
+CSRF_TRUSTED_ORIGINS = [
+    "http://89.116.51.124:3030",
 ]
 
 # Django REST Framework configuration
+_RENDERER_CLASSES = ["eje_central_back.renderers.ORJSONRenderer"]
+if DEBUG:
+    # Solo en desarrollo: la API navegable HTML de DRF no debe exponerse en
+    # producción (superficie extra + render lento de payloads grandes).
+    _RENDERER_CLASSES.append("rest_framework.renderers.BrowsableAPIRenderer")
+
 REST_FRAMEWORK = {
+    "DEFAULT_RENDERER_CLASSES": _RENDERER_CLASSES,
+    # Seguro por defecto: requiere autenticación salvo que la view declare
+    # AllowAny explícitamente (p. ej. los endpoints de login).
     "DEFAULT_PERMISSION_CLASSES": [
-        "rest_framework.permissions.AllowAny",
+        "rest_framework.permissions.IsAuthenticated",
+        # No-op en vistas sin view_permission/edit_permission declarado — permite
+        # retrofitear permisos por módulo de forma incremental sin romper nada.
+        "authentication.permissions.HasModulePermission",
     ],
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework.authentication.SessionAuthentication",
@@ -185,7 +253,7 @@ ZAFIRO_SCRIPT_PATH = os.getenv(
 CELERY_BEAT_SCHEDULE = {
     "zafiro-cada-30-minutos": {
         "task": "plantilla.tasks.importar_zafiro",
-        "schedule": crontab(minute='*/30'),
+        "schedule": crontab(minute="*/30"),
         "options": {"queue": "celery"},
     },
 }
@@ -197,5 +265,3 @@ CACHES = {
         "LOCATION": os.getenv("CELERY_BROKER_URL", "redis://127.0.0.1:6379/0"),
     }
 }
-
-

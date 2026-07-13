@@ -1,71 +1,99 @@
-# Backend Eje Central - Guía de Instalación para Windows 11
+# eje_central_back_copia — Celery en Windows
 
-Esta es la guía oficial para configurar y ejecutar el backend del sistema "Eje Central" en un entorno Windows 11.
+Copia standalone de `eje_central_back` para correr **Celery Worker + Beat**
+(`importar_zafiro`) en Windows. MySQL sigue siendo remoto (servidor
+compartido); **Redis corre local** en esta misma PC Windows.
 
-## 1. Requisitos Previos
-Asegúrate de tener instalados los siguientes programas en tu computadora:
-- **Python 3.10 o superior**: Al instalarlo, asegúrate de marcar la casilla "Add Python to PATH" durante el instalador.
-- **Node.js**: Necesario para ejecutar los scripts de scraping de Zafiro.
-- **Redis Server para Windows**: Celery requiere Redis para funcionar. Puedes instalarlo descargando [Memurai](https://www.memurai.com/) (un clon de Redis para Windows) o usando WSL (Windows Subsystem for Linux).
-- **MySQL**: (Opcional si tu base de datos ya está en la nube o en otro servidor como el `168.231.73.222`).
+No es una app Django/DRF nueva: `plantilla/tasks.py` depende del ORM,
+modelos y stored procedures del proyecto — el worker necesita el contexto
+Django completo, solo que sin servidor web.
 
-## 2. Preparar el entorno
+> Copia estática, no sincronizada con `eje_central_back`. Cambios en
+> `tasks.py`/`models.py`/etc. en el original hay que replicarlos aquí a mano.
 
-1. Abre tu terminal (`cmd` o `PowerShell`) y navega hasta esta carpeta:
-   ```cmd
-   cd C:\Ruta\A\Tu\Carpeta\copia_back
-   ```
+## Topología
 
-2. Crea un entorno virtual de Python:
-   ```cmd
-   python -m venv venv
-   ```
+- MySQL: remoto, `168.231.73.222:3306` (compartido con el backend Linux).
+- Redis: **local**, `127.0.0.1:6379` — broker + result backend + lock
+  distribuido + cache, todo aislado de cualquier Redis que use el backend
+  Linux.
+- Consecuencia: el lock `lock:importar_zafiro` (ver `tasks.py`) solo
+  deduplica ejecuciones dentro de ESTE Redis. Si el backend Linux también
+  corre `celery beat` apuntando a su propio Redis, **nada evita que ambos
+  disparen `importar_zafiro` al mismo tiempo** — el lock no cruza brokers.
+  Antes de arrancar `beat` aquí, confirma que esté apagado en Linux (o
+  viceversa). Solo un `beat` activo en todo el sistema.
 
-3. Activa el entorno virtual:
-   ```cmd
-   .\venv\Scripts\activate
-   ```
-   *(Si PowerShell te da un error de ejecución de scripts, abre PowerShell como administrador y ejecuta: `Set-ExecutionPolicy Unrestricted`)*
+## Requisitos
 
-4. Instala las dependencias del proyecto:
-   ```cmd
-   pip install -r requirements.txt
-   ```
-   *Nota: Hemos añadido `gevent` a las dependencias porque Celery en Windows no soporta el modelo por defecto (prefork).*
+- Python 3.12+ en PATH.
+- Node.js LTS (usa Selenium + Edge vía `edgedriver`; instala Microsoft Edge
+  si no está).
+- Redis para Windows corriendo en `127.0.0.1:6379` (ver abajo).
+- Acceso de red saliente a `168.231.73.222:3306` (MySQL).
+- `index.js` + `corregir_heuristico.exe` en `scripts\zafiro\` (ya
+  incluidos en esta copia).
 
-## 3. Configuración (.env)
+## Redis local en Windows
 
-Abre el archivo `.env` que se encuentra en la raíz de esta carpeta y ajusta las rutas para que coincidan con tu sistema de Windows:
-- **ZAFIRO_SCRIPT_PATH**: Debe apuntar al archivo `index.js` de tus scripts de Node. Ejemplo:
-  `ZAFIRO_SCRIPT_PATH = C:\Users\TuUsuario\Documents\SIORH-Back\automatizacion\scripts\index.js`
+Redis no tiene build oficial para Windows. Opciones, de más a menos simple:
 
-*Nota: La ruta de descarga (`ZAFIRO_DOWNLOAD_DIR`) se autoconfigura por defecto a tu carpeta de Descargas en Windows (ej. `C:\Users\TuUsuario\Downloads\ZafiroDescargas`).*
+1. **Memurai** (https://www.memurai.com) — Redis-compatible, build nativo
+   Windows, instalador MSI, corre como servicio. Recomendado para producción.
+2. **WSL2** + Redis nativo de Linux dentro (`sudo apt install redis-server`),
+   expuesto en `127.0.0.1:6379` al host Windows (WSL2 hace port-forward
+   automático a localhost).
+3. **Docker Desktop**: `docker run -d -p 6379:6379 redis:7`.
+4. Puerto de Microsoft/tporadowski (`redis-windows` en GitHub) — no
+   mantenido oficialmente, solo para dev/pruebas rápidas.
 
-## 4. Iniciar el Servidor Django
+Verifica con `redis-cli ping` → `PONG` antes de arrancar Celery.
 
-Asegúrate de que tu entorno virtual sigue activado, entra a la carpeta principal del código y ejecuta las migraciones (si aplica) y luego el servidor:
+## Instalación
 
-```cmd
-cd eje_central_back
-python manage.py migrate
-python manage.py runserver
-```
-El servidor ahora correrá en `http://127.0.0.1:8000/`.
-
-## 5. Iniciar Celery (Para tareas en segundo plano)
-
-Abre **otra ventana nueva** de terminal (`cmd` o `PowerShell`), navega a la misma ruta y **activa el entorno virtual de nuevo**:
-
-```cmd
-cd C:\Ruta\A\Tu\Carpeta\copia_back
-.\venv\Scripts\activate
-cd eje_central_back
+```bat
+install.bat
 ```
 
-A diferencia de Linux o Mac, **Celery en Windows requiere ejecutarse usando el pool `gevent`**. Ejecuta el siguiente comando para iniciar el *Worker*:
+Crea `venv\`, instala `requirements-windows.txt`, y copia `.env.example` a
+`.env` si no existe (esta copia ya trae un `.env` real, no lo pisa).
 
-```cmd
-celery -A eje_central_back worker -l info -P gevent
+`.env` ya viene con `SECRET_KEY`, MySQL y `control_gestion` prellenados.
+`CELERY_BROKER_URL` / `CELERY_RESULT_BACKEND` ya apuntan a
+`redis://127.0.0.1:6379/0`. Solo confirma `ZAFIRO_SCRIPT_PATH` con la ruta
+real donde quedó esta carpeta.
+
+## Arranque
+
+```bat
+start_worker.bat   REM worker solo
+start_beat.bat     REM beat solo — revisar topología arriba antes de correr
+start_all.bat      REM ambos, cada uno en su ventana
 ```
 
-¡Listo! Con esto tendrás tu entorno corriendo de manera estable en Windows 11.
+Modo primer plano (no servicio) — cerrar la ventana mata el proceso.
+
+## Adaptación Windows: `--pool=solo`
+
+`prefork` (default de Celery) usa `os.fork()`, no disponible en Windows.
+Los scripts usan `--pool=solo` (single-thread). No hay pérdida real de
+concurrencia: `importar_zafiro` ya serializa vía lock distribuido y corre
+una tarea larga (~hasta 30 min) a la vez.
+
+## `mysqlclient` no compila
+
+Sin wheel precompilado para tu versión de Python. Fallback sin compilar:
+
+```python
+# eje_central_back/__init__.py (el paquete Django, junto a celery.py)
+import pymysql
+pymysql.install_as_MySQLdb()
+```
+
+(`PyMySQL` ya está en `requirements-windows.txt`.)
+
+## Qué NO hace falta
+
+- `python manage.py migrate` — esquema ya existe en la BD compartida.
+- App Django/DRF nueva — se reutiliza `plantilla`, `authentication`, etc.
+- MySQL local — es remoto.

@@ -1,6 +1,7 @@
 from django.urls import path
 
 from .views import (
+    EmpleadosBusquedaView,
     TorreCaballitoSearchView,
     EmpleadosPorNivelYEstatusView,
     ExportExcelView,
@@ -11,13 +12,19 @@ from .views import (
     RegistrosPorOficio1800PlazasView,
     EmpleadosCompletosEstatusNominaResumenView,
     EmpleadosCompletosActivosDetalleView,
+    EmpleadosCompletosCeldaOverrideView,
     EmpleadosEstatusPorNivelUaView,
     EmpleadosDistribucionGeograficaView,
+    MovPosAlineacionView,
+    MovPosAlineacionHistoricoView,
     MovPosDetalleView,
+    MovPosExportExcelView,
     MovPosHistoriaView,
+    MovPosVacanciaDetalleView,
     CadenaMandoView,
     ZafiroBitacoraView,
     UltimaActualizacionZafiroView,
+    IniciarSincronizacionZafiroView,
     ZafiroSSEView,
     BajasSigListView,
     BajasMotivosPieView,
@@ -27,6 +34,22 @@ from .views import (
     TorreCaballito3DView,
     TorreCaballitoEmpleadosView,
     MovimientosPersonalListView,
+    MovimientosPersonalStatsView,
+    MovimientosPersonalHistorialView,
+    OrganigramaDeptoView,
+    OrganigramaTreeView,
+    OrganigramaPosicionInfoView,
+    OrganigramaUnidadesView,
+    OrganigramaCrearNodoView,
+    CatAccionesViewSet,
+    CatAccionesMotivosViewSet,
+    CatNivelJerarquicoPlazaViewSet,
+    CatPtoFuncViewSet,
+    OrganigramaAnamViewSet,
+    RcCatCodPresupuestalViewSet,
+    CuadroVacanciaView,
+    DesgloseJerarquicoView,
+    DesgloseJerarquicoOcupadosView,
 )
 
 urlpatterns = [
@@ -34,6 +57,138 @@ urlpatterns = [
         "movimientos-personal/",
         MovimientosPersonalListView.as_view(),
         name="movimientos-personal",
+    ),
+    path(
+        "movimientos-personal/stats/",
+        MovimientosPersonalStatsView.as_view(),
+        name="movimientos-personal-stats",
+    ),
+    path(
+        "movimientos-personal/historial/",
+        MovimientosPersonalHistorialView.as_view(),
+        name="movimientos-personal-historial",
+    ),
+    path(
+        "organigrama-deptos/",
+        OrganigramaDeptoView.as_view(),
+        name="organigrama-deptos",
+    ),
+    path(
+        "organigrama-tree/",
+        OrganigramaTreeView.as_view(),
+        name="organigrama-tree",
+    ),
+    path(
+        "organigrama-posicion-info/",
+        OrganigramaPosicionInfoView.as_view(),
+        name="organigrama-posicion-info",
+    ),
+    path(
+        "organigrama-unidades/",
+        OrganigramaUnidadesView.as_view(),
+        name="organigrama-unidades",
+    ),
+    path(
+        "organigrama-crear-nodo/",
+        OrganigramaCrearNodoView.as_view(),
+        name="organigrama-crear-nodo",
+    ),
+    path(
+        "empleados-search/",
+        EmpleadosBusquedaView.as_view(),
+        name="empleados-search",
+    ),
+    path(
+        "cat-acciones/",
+        CatAccionesViewSet.as_view({"get": "list", "post": "create"}),
+        name="cat-acciones",
+    ),
+    path(
+        "cat-acciones/<str:pk>/",
+        CatAccionesViewSet.as_view(
+            {"put": "update", "patch": "partial_update", "delete": "destroy"}
+        ),
+        name="cat-acciones-detail",
+    ),
+    path(
+        "cat-acciones-motivos/",
+        CatAccionesMotivosViewSet.as_view({"get": "list", "post": "create"}),
+        name="cat-acciones-motivos",
+    ),
+    path(
+        "cat-acciones-motivos/<int:pk>/",
+        CatAccionesMotivosViewSet.as_view(
+            {"put": "update", "patch": "partial_update", "delete": "destroy"}
+        ),
+        name="cat-acciones-motivos-detail",
+    ),
+    path(
+        "cat-pto-func/",
+        CatPtoFuncViewSet.as_view({"get": "list", "post": "create"}),
+        name="cat-pto-func",
+    ),
+    path(
+        "cat-pto-func/<int:pk>/",
+        CatPtoFuncViewSet.as_view(
+            {"put": "update", "patch": "partial_update", "delete": "destroy"}
+        ),
+        name="cat-pto-func-detail",
+    ),
+    path(
+        "cat-cod-presupuestal/",
+        RcCatCodPresupuestalViewSet.as_view({"get": "list", "post": "create"}),
+        name="cat-cod-presupuestal",
+    ),
+    path(
+        "cat-cod-presupuestal/<str:codigo_presupuestal>/<int:escala>/",
+        RcCatCodPresupuestalViewSet.as_view(
+            {"put": "update", "patch": "partial_update", "delete": "destroy"}
+        ),
+        name="cat-cod-presupuestal-detail",
+    ),
+    path(
+        "cat-organigrama-anam/",
+        OrganigramaAnamViewSet.as_view({"get": "list", "post": "create"}),
+        name="cat-organigrama-anam",
+    ),
+    path(
+        "cat-organigrama-anam/<str:pk>/",
+        OrganigramaAnamViewSet.as_view(
+            {"put": "update", "patch": "partial_update", "delete": "destroy"}
+        ),
+        name="cat-organigrama-anam-detail",
+    ),
+    path(
+        "cat-nivel-jerarquico-plaza/niveles/",
+        CatNivelJerarquicoPlazaViewSet.as_view({"get": "niveles"}),
+        name="cat-nivel-jerarquico-plaza-niveles",
+    ),
+    path(
+        "cat-nivel-jerarquico-plaza/bulk-assign/",
+        CatNivelJerarquicoPlazaViewSet.as_view({"post": "bulk_assign"}),
+        name="cat-nivel-jerarquico-plaza-bulk-assign",
+    ),
+    path(
+        "cat-nivel-jerarquico-plaza/prioridad/",
+        CatNivelJerarquicoPlazaViewSet.as_view({"get": "prioridad"}),
+        name="cat-nivel-jerarquico-plaza-prioridad",
+    ),
+    path(
+        "cat-nivel-jerarquico-plaza/aplicar-prioridad/",
+        CatNivelJerarquicoPlazaViewSet.as_view({"post": "aplicar_prioridad"}),
+        name="cat-nivel-jerarquico-plaza-aplicar-prioridad",
+    ),
+    path(
+        "cat-nivel-jerarquico-plaza/",
+        CatNivelJerarquicoPlazaViewSet.as_view({"get": "list", "post": "create"}),
+        name="cat-nivel-jerarquico-plaza",
+    ),
+    path(
+        "cat-nivel-jerarquico-plaza/<str:pk>/",
+        CatNivelJerarquicoPlazaViewSet.as_view(
+            {"put": "update", "patch": "partial_update", "delete": "destroy"}
+        ),
+        name="cat-nivel-jerarquico-plaza-detail",
     ),
     path(
         "torre-caballito/",
@@ -59,6 +214,11 @@ urlpatterns = [
         "bitacora/ultima/",
         UltimaActualizacionZafiroView.as_view(),
         name="zafiro_bitacora_ultima",
+    ),
+    path(
+        "bitacora/iniciar/",
+        IniciarSincronizacionZafiroView.as_view(),
+        name="zafiro_iniciar_sincronizacion",
     ),
     path(
         "bitacora/",
@@ -89,6 +249,11 @@ urlpatterns = [
         "empleados_completos_activos_detalle/",
         EmpleadosCompletosActivosDetalleView.as_view(),
         name="empleados_completos_activos_detalle",
+    ),
+    path(
+        "empleados_completos_sig/override/",
+        EmpleadosCompletosCeldaOverrideView.as_view(),
+        name="empleados_completos_sig_override",
     ),
     path(
         "empleados_por_nivel_y_estatus/",
@@ -126,6 +291,11 @@ urlpatterns = [
         name="empleados_distribucion_geografica",
     ),
     path(
+        "mov_pos_detalle/export_excel/",
+        MovPosExportExcelView.as_view(),
+        name="mov_pos_export_excel",
+    ),
+    path(
         "mov_pos_detalle/",
         MovPosDetalleView.as_view(),
         name="mov_pos_detalle",
@@ -134,6 +304,21 @@ urlpatterns = [
         "mov_pos_historia/",
         MovPosHistoriaView.as_view(),
         name="mov_pos_historia",
+    ),
+    path(
+        "mov_pos_vacancia_detalle/",
+        MovPosVacanciaDetalleView.as_view(),
+        name="mov_pos_vacancia_detalle",
+    ),
+    path(
+        "mov_pos_alineacion/",
+        MovPosAlineacionView.as_view(),
+        name="mov_pos_alineacion",
+    ),
+    path(
+        "mov_pos_alineacion_historico/",
+        MovPosAlineacionHistoricoView.as_view(),
+        name="mov_pos_alineacion_historico",
     ),
     path(
         "cadena_mando/",
@@ -159,5 +344,20 @@ urlpatterns = [
         "organigrama_search/",
         OrganigramaSearchView.as_view(),
         name="organigrama_search",
+    ),
+    path(
+        "cuadro_vacancia/",
+        CuadroVacanciaView.as_view(),
+        name="cuadro_vacancia",
+    ),
+    path(
+        "desglose_jerarquico/",
+        DesgloseJerarquicoView.as_view(),
+        name="desglose_jerarquico",
+    ),
+    path(
+        "desglose_jerarquico_ocupados/",
+        DesgloseJerarquicoOcupadosView.as_view(),
+        name="desglose_jerarquico_ocupados",
     ),
 ]

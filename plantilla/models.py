@@ -1,4 +1,6 @@
+from django.conf import settings
 from django.db import models
+from django.db.models.functions import Trim
 
 
 class PlantillaVacantesPorNivel(models.Model):
@@ -410,6 +412,10 @@ class Plantilla1800Plazas(models.Model):
     class Meta:
         managed = True
         db_table = "plantilla_1800_plazas"
+        indexes = [
+            models.Index(fields=["of_de_solicitud", "nivel"], name="idx_p1800_ofsol_niv"),
+            models.Index(fields=["nivel"], name="idx_p1800_nivel"),
+        ]
 
     def __str__(self):
         return f"Plantilla 1800 - {self.num_empleado} ({self.nombres})"
@@ -756,6 +762,9 @@ class MovPosBase(models.Model):
     fecha_captura = models.CharField(
         db_column="Fecha Captura", max_length=255, blank=True, null=True
     )
+    fecha_vacancia = models.CharField(
+        db_column="FECHA VACANCIA", max_length=255, blank=True, null=True
+    )
     cd_motivo = models.CharField(
         db_column="Cd Motivo", max_length=255, blank=True, null=True
     )
@@ -841,6 +850,18 @@ class MovPosBase(models.Model):
     nombre_puesto = models.CharField(
         db_column="Nombre Puesto", max_length=255, blank=True, null=True
     )
+    categoria_vacancia = models.CharField(
+        db_column="CATEGORIA_VACANCIA", max_length=255, blank=True, null=True
+    )
+    id_registro_desicivo = models.BigIntegerField(
+        db_column="idRegistroDesicivo", blank=True, null=True
+    )
+    tuvo_insubsistencia = models.CharField(
+        db_column="TUVO_INSUBSISTENCIA", max_length=1, blank=True, null=True, default="N"
+    )
+    id_insubsistencia_detectada = models.BigIntegerField(
+        db_column="idInsubsistenciaDetectada", blank=True, null=True
+    )
 
     class Meta:
         abstract = True
@@ -863,6 +884,8 @@ class CatPtoFunc(models.Model):
     cd_norm = models.CharField(
         db_column="CdNorm", max_length=255, blank=True, null=True
     )
+    modificado_por = models.CharField(max_length=255, blank=True, null=True)
+    fecha_modificacion = models.DateTimeField(blank=True, null=True, auto_now=True)
 
     class Meta:
         managed = True
@@ -872,10 +895,219 @@ class CatPtoFunc(models.Model):
         return f"{self.cd_pto_funcional} - {self.nombre_puesto_funcional}"
 
 
+class CatAcciones(models.Model):
+    """
+    Catálogo action -> action_description/descripcion. Adoptada vía
+    SeparateDatabaseAndState (la tabla ya existía en producción, poblada
+    por el pipeline ZAFIRO). CRUD con auditoría en CatAccionesViewSet.
+    """
+
+    action = models.CharField(primary_key=True, max_length=50)
+    action_description = models.CharField(max_length=255, blank=True, null=True)
+    effective_status = models.CharField(max_length=50, blank=True, null=True)
+    descripcion = models.TextField(blank=True, null=True)
+    modificado_por = models.CharField(max_length=255, blank=True, null=True)
+    fecha_modificacion = models.DateTimeField(blank=True, null=True, auto_now=True)
+
+    class Meta:
+        managed = True
+        db_table = "cat_acciones"
+
+    def __str__(self):
+        return f"{self.action} - {self.action_description}"
+
+
+class CatAccionesMotivos(models.Model):
+    """
+    Catálogo accion+cd_motivo -> descripcion/descripcion_larga. Adoptada vía
+    SeparateDatabaseAndState (tabla ya existente en producción).
+    """
+
+    id = models.AutoField(primary_key=True)
+    accion = models.CharField(max_length=10)
+    cd_motivo = models.CharField(max_length=10)
+    descripcion = models.CharField(max_length=255)
+    estado_efectivo = models.CharField(max_length=20)
+    descripcion_larga = models.TextField(blank=True, null=True)
+    modificado_por = models.CharField(max_length=255, blank=True, null=True)
+    fecha_modificacion = models.DateTimeField(blank=True, null=True, auto_now=True)
+
+    class Meta:
+        managed = True
+        db_table = "cat_acciones_motivos"
+
+    def __str__(self):
+        return f"{self.accion} - {self.cd_motivo}"
+
+
+class RcCatCodPresupuestal(models.Model):
+    """
+    Catálogo de niveles/escalas presupuestales (SMB/SMN por código+escala).
+    Pk compuesta real en BD (codigo_presupuestal, escala); adoptada vía
+    SeparateDatabaseAndState. Usada por los SPs de post-proceso de ZAFIRO
+    (`sp_corregir_smb_smn_empleados`, `sp_llenar_niveles_vacios_pos_activas`).
+    """
+
+    pk = models.CompositePrimaryKey("codigo_presupuestal", "escala")
+    codigo_presupuestal = models.CharField(max_length=55)
+    escala = models.SmallIntegerField()
+    nivel = models.CharField(max_length=55, blank=True, null=True)
+    smb = models.DecimalField(max_digits=55, decimal_places=2, blank=True, null=True)
+    smn = models.DecimalField(max_digits=55, decimal_places=2, blank=True, null=True)
+    nivel_jerarquico = models.CharField(max_length=55, blank=True, null=True)
+    modificado_por = models.CharField(max_length=255, blank=True, null=True)
+    fecha_modificacion = models.DateTimeField(blank=True, null=True, auto_now=True)
+
+    class Meta:
+        managed = True
+        db_table = "rc_cat_cod_presupuestal"
+
+    def __str__(self):
+        return f"{self.codigo_presupuestal} - {self.escala}"
+
+
+class OrganigramaAnam(models.Model):
+    """
+    Catálogo de estructura organizacional (unidad_negocio/departamento →
+    descripción, nivel de dirección, DOAF, posiciones de gerente/director).
+    Adoptada vía SeparateDatabaseAndState (tabla ya existente en producción,
+    poblada por el pipeline ZAFIRO). Usada por organigrama_tree.build_tree y
+    las vistas de búsqueda de organigrama en views.py.
+    """
+
+    departamento = models.CharField(primary_key=True, max_length=255)
+    unidad_negocio = models.CharField(max_length=255)
+    estado_fecha_efectiva = models.CharField(max_length=255)
+    descripcion_larga = models.CharField(max_length=500)
+    nivel_direccion = models.CharField(max_length=255, blank=True, null=True)
+    unidad_administrativa = models.CharField(max_length=255)
+    doaf = models.CharField(max_length=255)
+    num_posicion_gerente = models.CharField(max_length=255)
+    posicion_director = models.CharField(max_length=255)
+    subordinados = models.TextField(
+        blank=True, null=True,
+        help_text="Códigos de departamento (subordinados directos) separados por coma, "
+                   "calculados con la misma lógica de organigrama_tree.build_parent_map.",
+    )
+    modificado_por = models.CharField(max_length=255, blank=True, null=True)
+    fecha_modificacion = models.DateTimeField(blank=True, null=True, auto_now=True)
+
+    class Meta:
+        managed = True
+        db_table = "ORGANIGRAMA_ANAM"
+
+    def __str__(self):
+        return f"{self.departamento} - {self.descripcion_larga}"
+
+
+# Enum de negocio (NJ, Descripción). Nivel 3 tiene 2 descripciones válidas
+# ("Director" / "Titular de Aduana"), por eso la descripción -no el nivel- es
+# la clave única del enum: `nivel_jerarquico` se deriva de ella en save().
+NIVELES_JERARQUICOS = (
+    (0, "Titular de la Agencia Nacional de Aduanas de México"),
+    (1, "Director General"),
+    (2, "Director Central"),
+    (3, "Director"),
+    (3, "Titular de Aduana"),
+    (4, "Subdirector"),
+    (5, "Jefe de Departamento"),
+    (6, "Enlace"),
+    (7, "Operativo de Confianza"),
+    (8, "Operativo de Base"),
+)
+NIVEL_JERARQUICO_POR_DESCRIPCION = {descripcion: nivel for nivel, descripcion in NIVELES_JERARQUICOS}
+DESCRIPCION_NJ_CHOICES = [(descripcion, f"{nivel} — {descripcion}") for nivel, descripcion in NIVELES_JERARQUICOS]
+
+# Convención corta ya usada por ZAFIRO en las columnas NJ de EMPLEADOS_COMPLETOS_SIG
+# (no coincide textualmente con NIVELES_JERARQUICOS: p.ej. nivel 1 es "Titular", no
+# "Director General"; niveles 2 y 3 comparten "Director"). Verificada contra datos
+# reales de producción; nivel 0 no tiene precedente (sin empleados hoy en ese nivel).
+NIVEL_JERARQUICO_LABELS = {
+    0: {"nj": "0", "nj_comp": "0 Titular ANAM", "nj_ok": "0 TITULAR ANAM", "nombre_nj": "TITULAR ANAM", "nj_operativo_comb": "TITULAR ANAM"},
+    1: {"nj": "1", "nj_comp": "1 Titular", "nj_ok": "1 TITULAR", "nombre_nj": "TITULAR", "nj_operativo_comb": "TITULAR"},
+    2: {"nj": "2", "nj_comp": "2 Director", "nj_ok": "2 DIRECTOR", "nombre_nj": "DIRECTOR", "nj_operativo_comb": "DIRECTOR"},
+    3: {"nj": "3", "nj_comp": "3 Director", "nj_ok": "3 DIRECTOR", "nombre_nj": "DIRECTOR", "nj_operativo_comb": "DIRECTOR"},
+    4: {"nj": "4", "nj_comp": "4 Subdirector", "nj_ok": "4 SUBDIRECTOR", "nombre_nj": "SUBDIRECTOR", "nj_operativo_comb": "SUBDIRECTOR"},
+    5: {"nj": "5", "nj_comp": "5 Jefe de Depto", "nj_ok": "5 JEFE DE DEPTO", "nombre_nj": "JEFE DE DEPTO", "nj_operativo_comb": "JEFE DE DEPTO"},
+    6: {"nj": "6", "nj_comp": "6 Enlace", "nj_ok": "6 ENLACE", "nombre_nj": "ENLACE", "nj_operativo_comb": "ENLACE"},
+    7: {"nj": "7", "nj_comp": "7 Operativo Confianza", "nj_ok": "7 OPERATIVO CONFIANZA", "nombre_nj": "OPERATIVO CONFIANZA", "nj_operativo_comb": "OPERATIVOS"},
+    8: {"nj": "8", "nj_comp": "8 Operativo Base", "nj_ok": "8 OPERATIVO BASE", "nombre_nj": "OPERATIVO BASE", "nj_operativo_comb": "OPERATIVOS"},
+}
+
+FUENTE_PRIORIDAD_CHOICES = [
+    ("nivel_jerarquico", "Nivel Jerárquico (asignación manual)"),
+    ("nvl_direc_origen", "Nvl Direc (referencia MOV_POS)"),
+]
+
+
+class NivelJerarquicoPrioridadConfig(models.Model):
+    """
+    Config singleton (pk=1): cuál columna de cat_nivel_jerarquico_plaza manda
+    como fuente de verdad del nivel jerárquico al cruzar contra MOV_POS y
+    EMPLEADOS_COMPLETOS_SIG (checkbox de prioridad en el frontend). Se
+    reaplica automáticamente en cada import ZAFIRO (ver
+    plantilla.tasks._reaplicar_prioridad_nivel_jerarquico) porque esas dos
+    tablas se truncan y recargan completas cada 30 min.
+    """
+
+    fuente = models.CharField(max_length=20, choices=FUENTE_PRIORIDAD_CHOICES, blank=True, null=True)
+    modificado_por = models.CharField(max_length=255, blank=True, null=True)
+    fecha_modificacion = models.DateTimeField(blank=True, null=True, auto_now=True)
+
+    class Meta:
+        managed = True
+        db_table = "cat_nivel_jerarquico_prioridad"
+
+    def __str__(self):
+        return self.fuente or "sin prioridad"
+
+
+class CatNivelJerarquicoPlaza(models.Model):
+    """
+    Nivel jerárquico (enum NJ + descripción) asignado manualmente por plaza.
+    Se siembra/actualiza desde MOV_POS (plaza + Nvl Direc de referencia) en
+    cada import ZAFIRO (ver
+    `plantilla.tasks._sincronizar_plazas_nivel_jerarquico`); el nivel
+    jerárquico se asigna después en bloque desde el frontend (`bulk-assign`)
+    y no viene de ninguna fuente automática.
+    """
+
+    plaza = models.CharField(max_length=255, primary_key=True)
+    nivel_jerarquico = models.SmallIntegerField(blank=True, null=True, editable=False)
+    descripcion_nivel_jerarquico = models.CharField(
+        max_length=255, blank=True, null=True, choices=DESCRIPCION_NJ_CHOICES
+    )
+    nvl_direc_origen = models.CharField(
+        max_length=255, blank=True, null=True,
+        help_text="Referencia informativa: valor de 'Nvl Direc' en MOV_POS al momento de sincronizar.",
+    )
+    modificado_por = models.CharField(max_length=255, blank=True, null=True)
+    fecha_modificacion = models.DateTimeField(blank=True, null=True, auto_now=True)
+
+    class Meta:
+        managed = True
+        db_table = "cat_nivel_jerarquico_plaza"
+
+    def save(self, *args, **kwargs):
+        self.nivel_jerarquico = NIVEL_JERARQUICO_POR_DESCRIPCION.get(self.descripcion_nivel_jerarquico)
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.plaza} - {self.descripcion_nivel_jerarquico or 'sin asignar'}"
+
+
 class EmpleadosCompletosSig(EmpleadosCompletosSigBase):
     class Meta:
         managed = True
         db_table = "EMPLEADOS_COMPLETOS_SIG"
+        indexes = [
+            models.Index(fields=["nivel"], name="idx_emp_nivel"),
+            models.Index(fields=["estado_nomina"], name="idx_emp_estnom"),
+            # Índices de expresión: las views filtran con Trim(col); un índice
+            # plano no se usaría, uno funcional sobre TRIM(col) sí.
+            models.Index(Trim("nivel"), name="idx_emp_t_nivel"),
+            models.Index(Trim("estado_nomina"), name="idx_emp_t_estnom"),
+        ]
 
 
 class EmpleadosCompletosSigHistorico(EmpleadosCompletosSigBase):
@@ -890,6 +1122,12 @@ class BajasSig(BajasSigBase):
     class Meta:
         managed = True
         db_table = "BAJAS_SIG"
+        indexes = [
+            models.Index(fields=["posicion"], name="idx_baj_posicion"),
+            models.Index(fields=["fecha_efectiva"], name="idx_baj_fefec"),
+            models.Index(Trim("motivo_descr"), name="idx_baj_t_motdes"),
+            models.Index(Trim("accion_descr"), name="idx_baj_t_accdes"),
+        ]
 
 
 class BajasSigHistorico(BajasSigBase):
@@ -904,6 +1142,34 @@ class MovPos(MovPosBase):
     class Meta:
         managed = True
         db_table = "MOV_POS"
+        indexes = [
+            models.Index(fields=["f_efva", "fecha_captura"], name="idx_movpos_fefva_fcap"),
+            models.Index(Trim("estado_psn"), name="idx_mp_t_estpsn"),
+            models.Index(Trim("motivo"), name="idx_mp_t_motivo"),
+            models.Index(Trim("unidad_adva"), name="idx_mp_t_unidadv"),
+        ]
+
+
+class MovPosLatest(models.Model):
+    """
+    Una fila por `Nº Pos Actual` con el registro más reciente de MOV_POS
+    (mismo criterio que la window function ROW_NUMBER() OVER que antes se
+    recalculaba en cada request en 6+ endpoints, ver AUDITORIA_BUGS_BACK.md
+    BE2). La tarea de importación de ZAFIRO la reconstruye una vez al
+    final de cada swap Blue-Green; los endpoints solo hacen lookup indexado.
+    """
+
+    no_pos_actual = models.CharField(
+        db_column="Nº Pos Actual", max_length=255, primary_key=True
+    )
+    mov_pos_id = models.BigIntegerField(db_column="id")
+    estado_psn = models.CharField(
+        db_column="Estado Psn", max_length=255, blank=True, null=True, db_index=True
+    )
+
+    class Meta:
+        managed = True
+        db_table = "MOV_POS_LATEST"
 
 
 class MovPosHistorico(MovPosBase):
@@ -918,18 +1184,39 @@ class EmpleadosCompletosSigStaging(EmpleadosCompletosSigBase):
     class Meta:
         managed = True
         db_table = "EMPLEADOS_COMPLETOS_SIG_STAGING"
+        # Mismos índices que la tabla principal: el sync hace swap Blue-Green
+        # (RENAME staging<->main), así que la staging debe traerlos para que la
+        # main viva nunca quede sin índices.
+        indexes = [
+            models.Index(fields=["nivel"], name="idx_emps_nivel"),
+            models.Index(fields=["estado_nomina"], name="idx_emps_estnom"),
+            models.Index(Trim("nivel"), name="idx_emps_t_nivel"),
+            models.Index(Trim("estado_nomina"), name="idx_emps_t_estnom"),
+        ]
 
 
 class BajasSigStaging(BajasSigBase):
     class Meta:
         managed = True
         db_table = "BAJAS_SIG_STAGING"
+        indexes = [
+            models.Index(fields=["posicion"], name="idx_bajs_posicion"),
+            models.Index(fields=["fecha_efectiva"], name="idx_bajs_fefec"),
+            models.Index(Trim("motivo_descr"), name="idx_bajs_t_motdes"),
+            models.Index(Trim("accion_descr"), name="idx_bajs_t_accdes"),
+        ]
 
 
 class MovPosStaging(MovPosBase):
     class Meta:
         managed = True
         db_table = "MOV_POS_STAGING"
+        indexes = [
+            models.Index(fields=["f_efva", "fecha_captura"], name="idx_mps_fefva_fcap"),
+            models.Index(Trim("estado_psn"), name="idx_mps_t_estpsn"),
+            models.Index(Trim("motivo"), name="idx_mps_t_motivo"),
+            models.Index(Trim("unidad_adva"), name="idx_mps_t_unidadv"),
+        ]
 
 
 class ZafiroBitacora(models.Model):
@@ -953,8 +1240,33 @@ class ZafiroBitacora(models.Model):
         return f"{self.fecha_ejecucion} - {self.status}"
 
 
+class AlineacionOrganizacionalHistorico(models.Model):
+    """1 fila por día con el % de Alineación General (ver
+    `get_mov_pos_alineacion_stats` en plantilla/views.py) al momento en que
+    corrió la última importación ZAFIRO de ese día. Se actualiza (upsert por
+    `fecha`) al final de cada corrida de `importar_zafiro` en plantilla/tasks.py
+    solo si el valor cambió respecto al ya guardado, para tener un histórico
+    diario y poder graficar la tendencia en AlineacionOrganizacionalTab."""
+
+    fecha = models.DateField(unique=True)
+    porcentaje_alineacion_general = models.DecimalField(max_digits=5, decimal_places=1)
+    total_activas = models.IntegerField(default=0)
+    total_alineadas = models.IntegerField(default=0)
+    total_con_diferencias = models.IntegerField(default=0)
+    actualizado_en = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        managed = True
+        db_table = "ALINEACION_ORGANIZACIONAL_HISTORICO"
+        ordering = ["fecha"]
+
+    def __str__(self):
+        return f"{self.fecha} - {self.porcentaje_alineacion_general}%"
+
+
 class CpTblMovCompleto290526Base(models.Model):
-    posicion = models.CharField(max_length=50, primary_key=True)
+    id = models.AutoField(primary_key=True)
+    posicion = models.CharField(max_length=50, blank=True, null=True)
     num_empleado = models.CharField(max_length=20, blank=True, null=True)
     columna_c = models.CharField(
         db_column="columna_C", max_length=100, blank=True, null=True
@@ -1029,3 +1341,57 @@ class CpTblMovCompleto290526Historico(CpTblMovCompleto290526Base):
     class Meta:
         managed = False
         db_table = "cp_tbl_mov_completo_29_05_26_historico"
+
+class CuadroVacancia(models.Model):
+    fecha = models.DateField(unique=True)
+    ocupadas_permanente = models.IntegerField(default=0)
+    ocupadas_eventual = models.IntegerField(default=0)
+    ocupadas_total = models.IntegerField(default=0)
+    vacantes_permanente = models.IntegerField(default=0)
+    vacantes_eventual = models.IntegerField(default=0)
+    vacantes_total = models.IntegerField(default=0)
+    total_permanente = models.IntegerField(default=0)
+    total_eventual = models.IntegerField(default=0)
+    total = models.IntegerField(default=0)
+
+    class Meta:
+        db_table = 'cuadro_vacancia'
+        verbose_name = 'Cuadro Vacancia'
+        verbose_name_plural = 'Cuadros Vacancia'
+
+
+class CeldaOverride(models.Model):
+    """
+    Edición manual de una celda sobre una tabla alimentada por ZAFIRO (que se
+    trunca y recarga completa en cada `importar_zafiro`, ver tasks.py). No se
+    escribe encima del import: se registra aquí y se reaplica sobre la tabla
+    viva tanto al momento de editar como después de cada import (ver
+    `plantilla.celda_override.aplicar_overrides_empleados_completos`).
+    """
+
+    tabla = models.CharField(max_length=64, choices=[
+        ("EMPLEADOS_COMPLETOS_SIG", "Empleados"),
+        ("BAJAS_SIG", "Bajas"),
+        ("MOV_POS", "Movimientos Posición"),
+        ("CP_TBL_HISTORIAL", "Histórico Movimientos"),
+    ])
+    clave_negocio = models.JSONField()
+    clave_negocio_hash = models.CharField(max_length=64, db_index=True)
+    columna = models.CharField(max_length=128)
+    valor_original = models.TextField(null=True)
+    valor_nuevo = models.TextField()
+    usuario = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT)
+    fecha_modificacion = models.DateTimeField(auto_now=True)
+    activo = models.BooleanField(default=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["tabla", "clave_negocio_hash", "columna", "activo"]),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["tabla", "clave_negocio_hash", "columna"],
+                condition=models.Q(activo=True),
+                name="uniq_override_activo",
+            ),
+        ]
