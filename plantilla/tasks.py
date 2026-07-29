@@ -243,6 +243,43 @@ def _corregir_csv(csv_path: str, script_path: str, bitacora=None) -> str:
         return csv_path
 
 
+def _limpiar_perfiles_temporales_edge(bitacora=None):
+    """
+    Borra los perfiles temporales de Microsoft Edge (carpetas `scoped_dir*`
+    en %TEMP%) que quedan huérfanos cuando el script Node.js/Selenium falla
+    o se corta a medio camino (ej. timeout de descarga). Edge normalmente los
+    limpia solo vía `driver.quit()`, pero si el proceso muere antes de eso,
+    la carpeta del perfil (~100-150 MB c/u) queda para siempre.
+
+    Como el lock distribuido garantiza una sola instancia de esta tarea a la
+    vez, cualquier `scoped_dir*` que exista al iniciar es basura de una
+    corrida anterior: es seguro borrarlo. Sin esta limpieza, en unos días se
+    acumulan cientos de estas carpetas y llenan el disco (pasó en producción:
+    399 carpetas / 22 GB en pocos días).
+    """
+    import shutil
+    import tempfile
+
+    temp_dir = Path(tempfile.gettempdir())
+    borrados = 0
+    liberado_bytes = 0
+    for carpeta in temp_dir.glob("scoped_dir*"):
+        try:
+            size = sum(f.stat().st_size for f in carpeta.rglob("*") if f.is_file())
+            shutil.rmtree(carpeta, ignore_errors=True)
+            borrados += 1
+            liberado_bytes += size
+        except Exception:
+            pass
+
+    if borrados:
+        _append_log(
+            bitacora,
+            f"Limpieza de perfiles temporales de Edge: {borrados} carpeta(s) "
+            f"borrada(s), {liberado_bytes / (1024**3):.2f} GB liberados.",
+        )
+
+
 def _capturar_indices_secundarios(table):
     """Captura la DDL de los índices secundarios (no PRIMARY) de la tabla desde
     SHOW CREATE TABLE. Drift-proof: recrea exactamente lo que existe, incluidos
@@ -1335,34 +1372,44 @@ def importar_zafiro(self):
         )
         return {"status": "skipped", "reason": "otra instancia ya está en ejecución"}
 
-    download_dir = settings.ZAFIRO_DOWNLOAD_DIR
-    script_path = settings.ZAFIRO_SCRIPT_PATH
     resultados = {}
-
-    logger.info("=== Iniciando tarea importar_zafiro ===")
+    bitacora = None
     inicio = time.time()
 
-    # Asegurar que el directorio de descarga existe
-    Path(download_dir).mkdir(parents=True, exist_ok=True)
-
-    from datetime import datetime
-
-    ahora = datetime.now()
-    # Si son las 23:00 o más tarde, consideramos que es el último run del día para el histórico
-    es_historico = ahora.hour >= 23
-
-    bitacora = ZafiroBitacora.objects.create(
-        status="RUNNING",
-        es_historico=es_historico,
-        logs_en_vivo="",
-        registros_posiciones=0,
-        registros_completos=0,
-        registros_bajas=0,
-        registros_historial=0,
-    )
-    _append_log(bitacora, "=== Iniciando tarea importar_zafiro ===")
-
     try:
+        from django.db import close_old_connections
+
+        # Cierra conexiones de BD que pudieran haber quedado muertas (ej. un
+        # corte de red mientras el worker estaba idle) antes de escribir
+        # nada, para no arrastrar un socket roto a la primera query.
+        close_old_connections()
+
+        download_dir = settings.ZAFIRO_DOWNLOAD_DIR
+        script_path = settings.ZAFIRO_SCRIPT_PATH
+
+        logger.info("=== Iniciando tarea importar_zafiro ===")
+
+        # Asegurar que el directorio de descarga existe
+        Path(download_dir).mkdir(parents=True, exist_ok=True)
+
+        from datetime import datetime
+
+        ahora = datetime.now()
+        # Si son las 23:00 o más tarde, consideramos que es el último run del día para el histórico
+        es_historico = ahora.hour >= 23
+
+        bitacora = ZafiroBitacora.objects.create(
+            status="RUNNING",
+            es_historico=es_historico,
+            logs_en_vivo="",
+            registros_posiciones=0,
+            registros_completos=0,
+            registros_bajas=0,
+            registros_historial=0,
+        )
+        _append_log(bitacora, "=== Iniciando tarea importar_zafiro ===")
+        _limpiar_perfiles_temporales_edge(bitacora)
+
         # ── 1. Posiciones (argIndex=1) ─────────────────────────────────────
         _append_log(bitacora, "Descargando Posiciones (argIndex=1)...")
 
@@ -1531,15 +1578,45 @@ def importar_zafiro(self):
 
     except Exception as exc:
         duracion = round(time.time() - inicio, 1)
-        bitacora.duracion_segundos = duracion
-        bitacora.status = "ERROR"
-        bitacora.error_message = str(exc)
-        bitacora.save()
-        _append_log(bitacora, f"Error en importar_zafiro: {exc}", is_error=True)
+        logger.error("Error en importar_zafiro: %s", exc)
+
+        if bitacora is not None:
+            # La BD pudo haberse caído justo en medio del fallo (ej. el mismo
+            # corte de red que causó el error original) — reintentamos un par
+            # de veces cerrando conexiones muertas de por medio, para no
+            # perder el registro del error y dejar la bitácora atascada en
+            # RUNNING para siempre.
+            from django.db import close_old_connections
+
+            for intento in range(3):
+                try:
+                    close_old_connections()
+                    bitacora.duracion_segundos = duracion
+                    bitacora.status = "ERROR"
+                    bitacora.error_message = str(exc)
+                    bitacora.save()
+                    _append_log(bitacora, f"Error en importar_zafiro: {exc}", is_error=True)
+                    break
+                except Exception as db_exc:
+                    logger.error(
+                        "No se pudo guardar el estado de error en ZafiroBitacora "
+                        "(intento %s/3): %s",
+                        intento + 1,
+                        db_exc,
+                    )
+                    time.sleep(2)
+        else:
+            logger.error(
+                "importar_zafiro falló antes de poder crear la bitácora "
+                "(probablemente la BD era inalcanzable en ese momento)."
+            )
+
         raise self.retry(exc=exc)
 
     finally:
-        # Siempre liberar el lock al terminar (éxito, error, o retry)
+        # Siempre liberar el lock al terminar (éxito, error antes o después
+        # de crear la bitácora, o retry) — el lock nunca debe sobrevivir a
+        # la tarea que lo tomó.
         r.delete(LOCK_KEY)
 
 
