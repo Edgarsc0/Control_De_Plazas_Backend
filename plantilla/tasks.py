@@ -15,7 +15,8 @@ Tras importar los 4 reportes:
      staging (Blue-Green), dejando los datos nuevos en producción al
      instante, y trunca las tablas staging (que quedan con los datos viejos).
   5. Ejecuta stored procedures de post-proceso: llenar Nombre Puesto en
-     MOV_POS, corregir SMB/SMN en EMPLEADOS_COMPLETOS_SIG, y calcular/
+     MOV_POS; llenar Niveles vacíos y corregir SMB/SMN (en ese orden, ver
+     nota en el paso 6/7 más abajo) en EMPLEADOS_COMPLETOS_SIG; y calcular/
      actualizar fechas de vacancia.
   6. Regenera el Cuadro de Vacancia Diario (management command).
   7. Publica evento en Redis (canal "zafiro_updates") para notificar a
@@ -45,6 +46,7 @@ from pathlib import Path
 
 csv.field_size_limit(sys.maxsize)
 
+import requests
 from celery import shared_task
 from celery.utils.log import get_task_logger
 from django.conf import settings
@@ -1004,7 +1006,11 @@ def _corregir_smb_smn_empleados(bitacora):
     try:
         with connection.cursor() as cursor:
             cursor.execute("CALL sp_corregir_smb_smn_empleados();")
-            _append_log(bitacora, "SMB y SMN corregidos exitosamente.")
+            filas_afectadas = cursor.rowcount
+            _append_log(
+                bitacora,
+                f"SMB y SMN corregidos exitosamente ({filas_afectadas} fila(s) afectada(s)).",
+            )
     except Exception as e:
         _append_log(bitacora, f"Error corrigiendo SMB y SMN: {str(e)}")
         logger.error(f"Error en _corregir_smb_smn_empleados: {str(e)}", exc_info=True)
@@ -1127,6 +1133,98 @@ def _calcular_y_actualizar_vacancias(bitacora):
         logger.error(
             f"Error en _calcular_y_actualizar_vacancias: {str(e)}", exc_info=True
         )
+
+
+def _invalidar_cache_ocupacion_vacancia(bitacora=None):
+    """
+    Invalida cuanto antes los caches que determinan "¿está esta posición
+    ocupada?" y "¿cuál es su fecha de vacancia?" — se llama justo después del
+    swap Blue-Green + `_calcular_y_actualizar_vacancias`, en vez de esperar a
+    que termine TODA la tarea (los pasos que corren después —
+    sincronización/prioridad de nivel jerárquico, reaplicación de
+    CeldaOverride, cuadro de vacancia, histórico de alineación — no tocan
+    ocupación ni fecha de vacancia, así que no hace falta esperarlos).
+
+    Bug real reportado por el usuario: una posición aparecía "Vacante" (sin
+    fecha de vacancia) en Mov. Posiciones mientras Plantilla Detalle ya la
+    mostraba correctamente ocupada. Causa: el swap ya había dejado las
+    tablas frescas, pero `mov_pos_ocupadas_set` (TTL 600s) seguía sirviendo
+    el valor cacheado de ANTES del import — la única invalidación corría al
+    final de la tarea completa, que tarda 7-13 minutos (ver ZafiroBitacora),
+    dejando esa ventana de inconsistencia abierta todo ese tiempo. La
+    invalidación final (más abajo, al terminar la tarea) sigue existiendo
+    para los caches que sí dependen de los pasos posteriores.
+    """
+    try:
+        from django.core.cache import cache
+
+        cache.delete_many([
+            "mov_pos_ocupadas_set",
+            "active_position_codes",
+            "latest_movpos_sub_ids",
+            "mov_pos_detalle",
+            "mov_pos_card_stats",
+            "empleados_completos_activos_detalle",
+        ])
+        import redis as redis_lib
+
+        r = redis_lib.Redis.from_url(settings.CELERY_BROKER_URL)
+        for key in r.scan_iter("*empleados_completos_activos_detalle_*"):
+            r.delete(key)
+    except Exception:
+        logger.exception("Error al invalidar cache de ocupación/vacancia tras el swap")
+        return
+    if bitacora is not None:
+        _append_log(bitacora, "Cache de ocupación/fecha de vacancia invalidado (datos frescos disponibles de inmediato).")
+
+
+def _notificar_servidor_invalidar_cache(bitacora):
+    """
+    Notifica al backend del servidor (eje_central_back, 89.116.51.124) para
+    que invalide TODA su caché local y publique el evento SSE.
+
+    Por qué existe: esta tarea puede correr en una máquina distinta al
+    servidor que sirve a los usuarios (ver `copia_back`, PC Windows dedicada
+    a Celery). Las invalidaciones de arriba (`_invalidar_cache_ocupacion_
+    vacancia` y el bloque al final de `importar_zafiro`) solo pegan al Redis
+    LOCAL de la máquina donde corre esta tarea — si esa máquina no es el
+    servidor, los usuarios seguirían viendo datos viejos hasta que expire el
+    TTL de cada cache key. Este POST hace que el servidor invalide su propio
+    Redis vía `InvalidarCacheZafiroView` (plantilla/views.py).
+
+    Si `SERVER_CACHE_INVALIDATION_URL`/`_TOKEN` no están configurados (caso
+    normal cuando esta tarea corre EN el propio servidor, que ya invalida su
+    caché localmente arriba), no hace nada.
+    """
+    url = os.getenv("SERVER_CACHE_INVALIDATION_URL")
+    token = os.getenv("SERVER_CACHE_INVALIDATION_TOKEN")
+    if not url or not token:
+        return
+
+    ultimo_error = None
+    for intento in range(2):
+        try:
+            resp = requests.post(
+                url,
+                json={"bitacora_id": bitacora.id},
+                headers={"Authorization": f"Token {token}"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            _append_log(bitacora, "Servidor notificado: invalidó su caché remota exitosamente.")
+            return
+        except Exception as e:
+            ultimo_error = e
+            if intento == 0:
+                time.sleep(3)
+
+    logger.exception("Error al notificar al servidor para invalidar su caché", exc_info=ultimo_error)
+    _append_log(
+        bitacora,
+        f"Aviso: no se pudo notificar al servidor para invalidar su caché ({ultimo_error}). "
+        "Los usuarios verán datos viejos hasta que expire el TTL de cada cache key.",
+        is_error=True,
+    )
 
 
 def _actualizar_historico_alineacion_general(bitacora=None):
@@ -1310,14 +1408,22 @@ def importar_zafiro(self):
         # ── 5. Llenar Nombre Puesto en MOV_POS desde CAT_PTO_FUNC ──────────
         _llenar_nombre_puesto(bitacora)
 
-        # ── 6. Corregir SMB y SMN en EMPLEADOS_COMPLETOS_SIG desde catálogo ──
-        _corregir_smb_smn_empleados(bitacora)
-
-        # ── 7. Llenar Niveles vacíos en EMPLEADOS_COMPLETOS_SIG ────────────
+        # ── 6. Llenar Niveles vacíos en EMPLEADOS_COMPLETOS_SIG ────────────
+        # Debe correr ANTES de corregir SMB/SMN: el catálogo rc_cat_cod_presupuestal
+        # matchea por Código Presupuestal + Nivel + Escala, y varias posiciones
+        # llegan del CSV con Nivel vacío/NULL — sin este paso primero, esas filas
+        # nunca matchean y se quedan con el SMB/SMN crudo (placeholder ' '/VACANTE).
         _llenar_niveles_vacios_pos_activas(bitacora)
+
+        # ── 7. Corregir SMB y SMN en EMPLEADOS_COMPLETOS_SIG desde catálogo ──
+        _corregir_smb_smn_empleados(bitacora)
 
         # ── 8. Calcular y Actualizar Fechas de Vacancia ─────────────────────
         _calcular_y_actualizar_vacancias(bitacora)
+
+        # Invalida YA los caches de ocupación/fecha de vacancia — no esperar
+        # a que termine toda la tarea (ver _invalidar_cache_ocupacion_vacancia).
+        _invalidar_cache_ocupacion_vacancia(bitacora)
 
         # ── 9. Sincronizar cat_nivel_jerarquico_plaza desde MOV_POS ────────
         _sincronizar_plazas_nivel_jerarquico(bitacora)
@@ -1352,18 +1458,10 @@ def importar_zafiro(self):
         bitacora.status = "EXITO"
         bitacora.save()
 
-        # Publicar evento de actualización exitosa a Redis para tiempo real (SSE)
-        try:
-            from datetime import timedelta
-
-            fecha_fin = bitacora.fecha_ejecucion
-            if bitacora.duracion_segundos:
-                fecha_fin += timedelta(seconds=bitacora.duracion_segundos)
-            r.publish("zafiro_updates", fecha_fin.isoformat())
-        except Exception as e:
-            logger.error("Error al publicar evento de actualización en Redis: %s", e)
-
-        # Invalida cache de posiciones activas y dashboard para recargar en siguiente request
+        # Invalida cache de posiciones activas y dashboard ANTES de publicar el
+        # evento SSE: los clientes reaccionan al publish con un router.refresh()
+        # casi inmediato, así que si el cache siguiera vivo en ese instante
+        # podrían recargar y seguir viendo datos viejos.
         try:
             from django.core.cache import cache
 
@@ -1382,20 +1480,40 @@ def importar_zafiro(self):
                 "mov_pos_card_stats",
                 "mov_pos_ocupadas_set",
                 "desglose_jerarquico",
+                "desglose_jerarquico_ocupados",
                 "bajas_sig_list",
                 "bajas_motivos_pie",
                 "bajas_historico",
                 "mov_pos_alineacion_dataset",
                 "mov_pos_alineacion_stats",
+                "estadisticas_globales",
+                "latest_mov_pos_ids",
             ]
             cache.delete_many(cache_keys)
 
             # Invalidar por patrón las claves hasheadas por parámetros de request
-            for pattern in ("*mov_stats_*", "*bajas_sig_list_*", "*empleados_completos_activos_detalle_*", "*excel_estatus_file_*"):
+            for pattern in ("*mov_stats_*", "*bajas_sig_list_*", "*empleados_completos_activos_detalle_*", "*excel_estatus_file_*", "*excel_task_result_*"):
                 for key in r.scan_iter(pattern):
                     r.delete(key)
         except Exception:
             logger.exception("Error al invalidar caché tras importación de ZAFIRO")
+
+        # Publicar evento de actualización exitosa a Redis para tiempo real (SSE)
+        try:
+            from datetime import timedelta
+
+            fecha_fin = bitacora.fecha_ejecucion
+            if bitacora.duracion_segundos:
+                fecha_fin += timedelta(seconds=bitacora.duracion_segundos)
+            r.publish("zafiro_updates", fecha_fin.isoformat())
+        except Exception as e:
+            logger.error("Error al publicar evento de actualización en Redis: %s", e)
+
+        # Si esta tarea corrió en una máquina distinta al servidor (ver
+        # copia_back/PC Windows), la invalidación de arriba solo pegó al
+        # Redis local de esta máquina — avisar al servidor para que invalide
+        # el suyo también (no-op si no está configurado, ver docstring).
+        _notificar_servidor_invalidar_cache(bitacora)
 
         # ── 12. Actualizar histórico diario de % Alineación General ────────
         _actualizar_historico_alineacion_general(bitacora)
@@ -1440,6 +1558,7 @@ def generar_excel_estatus_task(self, uas_param, levels_param, group_by):
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
     from openpyxl.utils import get_column_letter
 
+    from .excel_letterhead import add_excel_letterhead
     from .views import obtener_posiciones_activas
 
     self.update_state(
@@ -1568,9 +1687,14 @@ def generar_excel_estatus_task(self, uas_param, levels_param, group_by):
         det_ws = wb.create_sheet(title=sheet_name)
         det_ws.sheet_view.showGridLines = True
 
-        back_cell = det_ws.cell(row=1, column=1, value="← Volver al Resumen")
+        # HYPERLINK() en vez de cell.hyperlink=...: openpyxl escribe los enlaces
+        # internos con una relación r:id apuntando a TargetMode="External" cuyo
+        # Target es el propio texto "#'Hoja'!Celda" (no una URL) — Excel no
+        # puede resolverlo y marca "Referencia no válida" en TODOS los
+        # enlaces. La fórmula HYPERLINK() no depende de relaciones externas.
+        back_cell = det_ws.cell(row=1, column=1)
+        back_cell.value = f"=HYPERLINK(\"#'Resumen'!{parent_cell.coordinate}\",\"← Volver al Resumen\")"
         back_cell.font = link_font
-        back_cell.hyperlink = f"#'Resumen'!{parent_cell.coordinate}"
 
         det_ws.merge_cells(f"A3:{last_col_letter}3")
         det_title = det_ws.cell(row=3, column=1, value=title_text)
@@ -1610,10 +1734,21 @@ def generar_excel_estatus_task(self, uas_param, levels_param, group_by):
             col_letter = get_column_letter(c_idx)
             det_ws.column_dimensions[col_letter].width = max(max_len + 3, 11)
 
-        parent_cell.hyperlink = f"#'{sheet_name}'!A1"
+        existing_value = parent_cell.value
+        if isinstance(existing_value, str) and existing_value.startswith("="):
+            display_expr = existing_value[1:]
+        elif isinstance(existing_value, str):
+            display_expr = f'"{existing_value}"'
+        else:
+            display_expr = existing_value if existing_value is not None else '""'
+        parent_cell.value = f"=HYPERLINK(\"#'{sheet_name}'!A1\",{display_expr})"
         parent_cell.font = parent_font
 
-    current_row = 1
+    # Membretado solo en "Resumen" (hoja de entrada) — las hojas Det_N
+    # (creadas al vuelo, ver create_detail_sheet) no lo llevan: su fila 1 ya
+    # se usa para el hipervínculo "Volver al Resumen" y pueden ser cientos.
+    letterhead_off = add_excel_letterhead(ws, 8)
+    current_row = letterhead_off + 1
 
     if group_by == "level":
         ws.column_dimensions["A"].width = 30
@@ -1675,6 +1810,7 @@ def generar_excel_estatus_task(self, uas_param, levels_param, group_by):
             current_row += 1
 
             start_table_row = current_row
+            level_employees_shown = []
 
             for ua_name in uas_in_level:
                 ua_name_lower = ua_name.lower()
@@ -1686,6 +1822,7 @@ def generar_excel_estatus_task(self, uas_param, levels_param, group_by):
                 ua_level_employees = [
                     emp for emp in level_employees if emp["_ua_lower"] == ua_name_lower
                 ]
+                level_employees_shown.extend(ua_level_employees)
 
                 for status_idx, status_name in enumerate(status_list, 2):
                     subset = [
@@ -1749,7 +1886,7 @@ def generar_excel_estatus_task(self, uas_param, levels_param, group_by):
 
                 status_employees = [
                     emp
-                    for emp in level_employees
+                    for emp in level_employees_shown
                     if emp["_friendly_status"] == status_name
                 ]
                 status_count = len(status_employees)
@@ -1772,11 +1909,11 @@ def generar_excel_estatus_task(self, uas_param, levels_param, group_by):
             cell_grand_total.border = total_border
             cell_grand_total.fill = grand_total_fill
 
-            grand_total_count = len(level_employees)
+            grand_total_count = len(level_employees_shown)
             if grand_total_count > 0:
                 create_detail_sheet(
                     f"Nivel: {level} | UA: TODOS | Estatus: TODOS",
-                    level_employees,
+                    level_employees_shown,
                     cell_grand_total,
                     bold_link_font,
                 )
@@ -1829,6 +1966,7 @@ def generar_excel_estatus_task(self, uas_param, levels_param, group_by):
             current_row += 1
 
             start_table_row = current_row
+            ua_employees_shown = []
 
             for level_name in levels_in_ua:
                 lvl_lower = level_name.lower()
@@ -1845,6 +1983,7 @@ def generar_excel_estatus_task(self, uas_param, levels_param, group_by):
                     level_employees = [
                         emp for emp in ua_employees if emp["_level_lower"] == lvl_lower
                     ]
+                ua_employees_shown.extend(level_employees)
 
                 for status_idx, status_name in enumerate(status_list, 2):
                     subset = [
@@ -1908,7 +2047,7 @@ def generar_excel_estatus_task(self, uas_param, levels_param, group_by):
 
                 status_employees = [
                     emp
-                    for emp in ua_employees
+                    for emp in ua_employees_shown
                     if emp["_friendly_status"] == status_name
                 ]
                 status_count = len(status_employees)
@@ -1931,11 +2070,11 @@ def generar_excel_estatus_task(self, uas_param, levels_param, group_by):
             cell_grand_total.border = total_border
             cell_grand_total.fill = grand_total_fill
 
-            grand_total_count = len(ua_employees)
+            grand_total_count = len(ua_employees_shown)
             if grand_total_count > 0:
                 create_detail_sheet(
                     f"UA: {ua} | Nivel: TODOS | Estatus: TODOS",
-                    ua_employees,
+                    ua_employees_shown,
                     cell_grand_total,
                     bold_link_font,
                 )
