@@ -249,6 +249,14 @@ ZAFIRO_SCRIPT_PATH = os.getenv(
     r"C:\Users\Edgar\ANAM\COPIA SIORH\SIOHR\SIORH-Back\automatizacion\scripts\index.js",
 )
 
+# Ruta al script Node.js de "Poblado para credenciales". Vive en la misma
+# carpeta que index.js (scripts/zafiro/), como script aislado y separado del
+# de ZAFIRO — no comparte código ni afecta la tarea importar_zafiro.
+POBLADO_CREDENCIALES_SCRIPT_PATH = os.getenv(
+    "POBLADO_CREDENCIALES_SCRIPT_PATH",
+    str(Path(ZAFIRO_SCRIPT_PATH).parent / "poblado_credenciales.js"),
+)
+
 # Schedule: Cada 30 minutos (48 veces al día)
 CELERY_BEAT_SCHEDULE = {
     "zafiro-cada-30-minutos": {

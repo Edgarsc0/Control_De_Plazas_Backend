@@ -1597,6 +1597,21 @@ def importar_zafiro(self):
         # ── 12. Actualizar histórico diario de % Alineación General ────────
         _actualizar_historico_alineacion_general(bitacora)
 
+        # ── 13. Encadenar Poblado para credenciales ─────────────────────────
+        # .delay() solo encola la tarea y retorna de inmediato (no ejecuta nada
+        # aquí ni espera resultado) — por diseño no puede alentar ni interrumpir
+        # importar_zafiro. Va dentro de un try/except propio para que un fallo
+        # al encolar (ej. Redis caído) jamás tumbe el resultado ya exitoso de
+        # esta tarea.
+        try:
+            importar_poblado_credenciales.delay()
+        except Exception as exc:
+            logger.error(
+                "No se pudo encolar importar_poblado_credenciales tras "
+                "importar_zafiro: %s",
+                exc,
+            )
+
         _append_log(
             bitacora,
             f"=== Tarea completada en {duracion}s | Posiciones: {total_posiciones} | Completos: {total_completos} | Bajas: {total_bajas} | Historial: {total_historial} ===",
@@ -2223,3 +2238,125 @@ def generar_excel_estatus_task(self, uas_param, levels_param, group_by):
         state="SUCCESS", meta={"progress": 100, "message": "¡Completado!"}
     )
     return True
+
+
+# =============================================================================
+# NUEVO: Poblado para credenciales (tarea aislada, no modifica importar_zafiro)
+# =============================================================================
+#
+# Descarga la consulta "Poblado para credenciales" (Recursos Humanos >
+# Planeación RRHH > Procesos Especiales > Poblado para credenciales), un
+# módulo distinto de "Informacion ZAFIRO" (que usa index.js). Vive en su
+# propio script (poblado_credenciales.js) y su propia tarea a propósito:
+# así importar_zafiro —que corre cada 30 min y ya es la tarea más crítica
+# del sistema— nunca se ve afectada si este flujo nuevo falla, tarda, o se
+# reescribe mientras capturamos la navegación real.
+#
+# Se dispara con .delay() al final de importar_zafiro (ver el bloque
+# "Encadenar Poblado para credenciales" en esa tarea) — no bloquea ni
+# alenta la tarea principal porque .delay() solo encola y retorna de
+# inmediato; el trabajo real lo hace un worker de Celery por separado.
+
+POBLADO_CREDENCIALES_LOCK_KEY = "lock:importar_poblado_credenciales"
+POBLADO_CREDENCIALES_LOCK_TTL = 900  # 15 minutos (safety net)
+
+
+def _ejecutar_script_node_generico(
+    script_path: str, download_dir: str, timeout_seg: int = 900
+) -> subprocess.CompletedProcess:
+    """
+    Lanza un script Node.js pasando <download_dir> como único argumento
+    posicional (a diferencia de _ejecutar_script_node, que además maneja
+    argIndex/nombres de archivo fijos específicos de ZAFIRO_FILES).
+    """
+    return subprocess.run(
+        ["node", script_path, download_dir],
+        capture_output=True,
+        text=True,
+        timeout=timeout_seg,
+        cwd=str(Path(script_path).parent),
+    )
+
+
+@shared_task(
+    bind=True,
+    name="plantilla.tasks.importar_poblado_credenciales",
+    max_retries=2,
+    default_retry_delay=300,
+)
+def importar_poblado_credenciales(self):
+    """
+    Tarea Celery independiente para "Poblado para credenciales".
+
+    TODO: en cuanto poblado_credenciales.js tenga la navegación real
+    capturada y sepamos el formato del archivo resultante (CSV/Excel) y la
+    tabla destino, completar aquí el parseo + import (mismo patrón que
+    _importar_csv_* de arriba: staging + bulk_create, o upsert directo si
+    no se justifica un swap Blue-Green para este volumen de datos).
+
+    Por ahora solo ejecuta el script y deja constancia en el log de Celery
+    de si la descarga se completó, para poder validar el scraping de forma
+    aislada antes de conectar el import a una tabla real.
+    """
+    import redis as redis_lib
+
+    r = redis_lib.Redis.from_url(settings.CELERY_BROKER_URL)
+    lock_acquired = r.set(
+        POBLADO_CREDENCIALES_LOCK_KEY,
+        self.request.id,
+        nx=True,
+        ex=POBLADO_CREDENCIALES_LOCK_TTL,
+    )
+
+    if not lock_acquired:
+        logger.warning(
+            "importar_poblado_credenciales ya está en ejecución (lock=%s). "
+            "Descartando tarea duplicada %s.",
+            r.get(POBLADO_CREDENCIALES_LOCK_KEY),
+            self.request.id,
+        )
+        return {"status": "skipped", "reason": "otra instancia ya está en ejecución"}
+
+    try:
+        download_dir = settings.ZAFIRO_DOWNLOAD_DIR
+        script_path = settings.POBLADO_CREDENCIALES_SCRIPT_PATH
+
+        logger.info("=== Iniciando tarea importar_poblado_credenciales ===")
+
+        if not Path(script_path).exists():
+            logger.warning(
+                "poblado_credenciales.js no encontrado en %s — tarea omitida "
+                "(pendiente de configurar POBLADO_CREDENCIALES_SCRIPT_PATH).",
+                script_path,
+            )
+            return {"status": "skipped", "reason": "script no encontrado"}
+
+        resultado = _ejecutar_script_node_generico(script_path, download_dir)
+
+        if resultado.returncode != 0:
+            logger.error(
+                "poblado_credenciales.js falló (código %s):\n%s",
+                resultado.returncode,
+                resultado.stderr,
+            )
+            raise RuntimeError(
+                f"poblado_credenciales.js falló con código {resultado.returncode}: "
+                f"{resultado.stderr}"
+            )
+
+        logger.info(
+            "=== importar_poblado_credenciales: script completado ===\n%s",
+            resultado.stdout,
+        )
+
+        # TODO: parsear el archivo descargado e importarlo a su tabla destino
+        # una vez que sepamos formato y esquema (ver docstring de la tarea).
+
+        return {"status": "ok", "stdout": resultado.stdout}
+
+    except Exception as exc:
+        logger.error("Error en importar_poblado_credenciales: %s", exc)
+        raise self.retry(exc=exc)
+
+    finally:
+        r.delete(POBLADO_CREDENCIALES_LOCK_KEY)
