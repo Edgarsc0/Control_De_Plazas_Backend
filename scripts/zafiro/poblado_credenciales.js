@@ -21,14 +21,19 @@
  *   4. El componente POBLADO.POBLADO_CRED.GBL carga, por analogía directa
  *      con descargarExcel.js/consultas.js, dentro del frame "ptifrmtgtframe"
  *      (mismo frame donde vive el work record ZAFIRO_WRK en index.js).
- *   5. Checkbox "Poblado Excel" = POBLADO_WRK_FLAG2 (ya viene marcado por
- *      defecto en el portal; el script lo deja idempotente). Botón
+ *   5. Checkbox "Poblado SQL" = POBLADO_WRK_FLAG (la consulta, preferida sobre
+ *      "Poblado Excel" = POBLADO_WRK_FLAG2 porque cada INSERT trae el nombre
+ *      de columna junto al valor — no depende de encoding/orden de columnas
+ *      como el CSV). "Poblado Excel" viene marcada por defecto, así que se
+ *      desmarca explícitamente y se marca solo "Poblado SQL". Botón
  *      "Ejecutar" = POBLADO_WRK_EXECUTE_PB.
- *   6. Confirmado por el usuario: al ejecutar aparece un loader arriba a la
- *      derecha (~30s o menos) y al terminar el navegador dispara la
- *      descarga automáticamente — NO hay pantalla de Process Monitor que
- *      sondear (a diferencia de descargarExcel.js/consultas.js). Mismo
- *      patrón de espera que index.js (waitForNewDownload).
+ *   6. Confirmado por el usuario: al ejecutar con "Poblado SQL" NO se dispara
+ *      una descarga a disco — se abre una pestaña/ventana nueva navegando a
+ *      una URL tipo ".../tmpdb/POBLADO_CRED.TXT" con el SQL (DELETE +
+ *      INSERTs en sintaxis T-SQL/SQL Server) como texto plano. El script
+ *      cambia al handle de esa ventana nueva, lee el texto del body, lo
+ *      guarda como poblado_credenciales.sql, cierra esa ventana y regresa a
+ *      la principal.
  *
  * Si algún paso no calza exactamente con el portal real (ej. el frame no es
  * "ptifrmtgtframe"), el catch de abajo deja un screenshot
@@ -82,6 +87,25 @@ async function waitForNewDownload(dir, previos, timeoutMs = 900000) {
     await new Promise((r) => setTimeout(r, 1000));
   }
   throw new Error(`Timeout: descarga no completó en ${timeoutMs / 1000}s`);
+}
+
+/**
+ * Espera a que se abra una ventana/pestaña nueva (comparado contra los
+ * handles que ya existían antes de disparar la acción) y regresa su handle.
+ * "Poblado SQL" navega a la URL del .TXT en una pestaña nueva en vez de
+ * descargar un archivo, así que esto reemplaza a waitForNewDownload para
+ * ese flujo específico (waitForNewDownload se deja arriba por si se vuelve
+ * a necesitar el flujo de "Poblado Excel").
+ */
+async function esperarVentanaNueva(driver, handlesPrevios, timeoutMs = 60000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const handlesActuales = await driver.getAllWindowHandles();
+    const nueva = handlesActuales.find((h) => !handlesPrevios.includes(h));
+    if (nueva) return nueva;
+    await driver.sleep(500);
+  }
+  throw new Error(`Timeout: no se abrió una ventana/pestaña nueva en ${timeoutMs / 1000}s`);
 }
 
 async function clickLinkByText(driver, text, timeoutMs = 15000) {
@@ -210,37 +234,52 @@ const main = async () => {
     // ---- El componente carga en ptifrmtgtframe (igual que ZAFIRO_WRK) ----
     await switchToWorkFrame(driver, "ptifrmtgtframe", 15000);
 
-    // ---- Checkbox "Poblado Excel" — idempotente, ya viene marcado por
-    // defecto en el portal, pero lo forzamos por si alguna vez no lo está ----
-    await driver.wait(until.elementLocated(By.id("POBLADO_WRK_FLAG2")), 10000);
-    const yaMarcado = await driver.executeScript(
-      "var cb = document.getElementById('POBLADO_WRK_FLAG2'); return cb ? cb.checked : false;",
-    );
-    if (!yaMarcado) {
-      await driver.executeScript(
-        "document.getElementById('POBLADO_WRK_FLAG2').click();",
-      );
-      await driver.sleep(500);
-    }
+    // ---- Checkbox "Poblado SQL" (POBLADO_WRK_FLAG) — queremos SOLO esta
+    // marcada. "Poblado Excel" (POBLADO_WRK_FLAG2) viene marcada por
+    // defecto, así que se desmarca explícitamente primero. ----
+    await driver.wait(until.elementLocated(By.id("POBLADO_WRK_FLAG")), 10000);
 
-    // ---- Ejecutar y esperar la descarga automática del navegador --------
-    // Confirmado en el portal real: aparece un loader (~30s o menos) y al
-    // terminar el navegador dispara la descarga solo — sin pantalla de
-    // Process Monitor que sondear (a diferencia de descargarExcel.js).
-    const previos = snapshotArchivos(DOWNLOAD_DIR);
+    await driver.executeScript(
+      "var excel = document.getElementById('POBLADO_WRK_FLAG2'); if (excel && excel.checked) { excel.click(); }",
+    );
+    await driver.sleep(300);
+
+    await driver.executeScript(
+      "var sql = document.getElementById('POBLADO_WRK_FLAG'); if (sql && !sql.checked) { sql.click(); }",
+    );
+    await driver.sleep(300);
+
+    // ---- Ejecutar. A diferencia de "Poblado Excel", esto NO descarga un
+    // archivo: abre una pestaña/ventana nueva navegando a una URL .TXT con
+    // el SQL (DELETE + INSERTs) como texto plano. Cambiamos a esa ventana,
+    // leemos el texto, lo guardamos, y cerramos esa ventana. ----
+    const ventanasAntes = await driver.getAllWindowHandles();
+
     const btn = await driver.findElement(By.id("POBLADO_WRK_EXECUTE_PB"));
     await driver.executeScript("arguments[0].scrollIntoView(true);", btn);
     await driver.sleep(500);
     await btn.click();
 
-    const archivoDescargado = await waitForNewDownload(DOWNLOAD_DIR, previos, 120000);
-    const ext = path.extname(archivoDescargado) || ".csv";
-    const nombreFinal = `poblado_credenciales${ext}`;
-    fs.renameSync(
-      path.join(DOWNLOAD_DIR, archivoDescargado),
-      path.join(DOWNLOAD_DIR, nombreFinal),
-    );
-    console.log(`Archivo guardado: ${nombreFinal}`);
+    const ventanaNueva = await esperarVentanaNueva(driver, ventanasAntes, 120000);
+    await driver.switchTo().window(ventanaNueva);
+    await driver.wait(until.elementLocated(By.css("body")), 15000);
+
+    const contenidoSql = await driver.findElement(By.css("body")).getText();
+
+    if (!contenidoSql || !contenidoSql.toLowerCase().includes("insert into")) {
+      throw new Error(
+        "La ventana nueva no contiene el SQL esperado (¿cambió el formato del portal?).",
+      );
+    }
+
+    const nombreFinal = "poblado_credenciales.sql";
+    fs.writeFileSync(path.join(DOWNLOAD_DIR, nombreFinal), contenidoSql, "utf-8");
+    console.log(`Archivo guardado: ${nombreFinal} (${contenidoSql.length} caracteres)`);
+
+    // Cerrar la ventana del texto y regresar a la principal antes de salir.
+    await driver.close();
+    await driver.switchTo().window(ventanasAntes[0]);
+
     console.log("Proceso terminado: Poblado para credenciales");
   } catch (error) {
     console.error("Error:", error.message);
