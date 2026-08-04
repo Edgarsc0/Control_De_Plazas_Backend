@@ -2327,28 +2327,36 @@ _SICRE_TBL_SIG_COLUMNAS_STAGING = [
 
 
 def _parsear_fecha_poblado_credenciales(valor: str):
-    """'04/01/2026' (MM/DD/YYYY) -> date. None si viene vacío o no parsea."""
+    """
+    '30/04/2026' (DD/MM/YYYY) -> date. None si viene vacío o no parsea.
+
+    Confirmado con datos reales: es DD/MM/YYYY, no MM/DD/YYYY -- el volcado
+    de "Poblado SQL" (T-SQL, no se usa aquí) sí trae MM/DD, pero "Poblado
+    Excel" (el que se usa) trae DD/MM. Se ve inequívoco en filas con día >12
+    (ej. '30/04/2026').
+    """
     valor = (valor or "").strip()
     if not valor:
         return None
     try:
         from datetime import datetime
-        return datetime.strptime(valor, "%m/%d/%Y").date()
+        return datetime.strptime(valor, "%d/%m/%Y").date()
     except ValueError:
         return None
 
 
 def _leer_csv_poblado_credenciales(csv_path: str, bitacora=None) -> list:
     """
-    Lee el CSV de "Poblado para credenciales" (delimitador '|', UTF-8 --
-    confirmado al inspeccionar el archivo real, a diferencia de los CSV de
-    ZAFIRO que son cp1252) y regresa una lista de tuplas listas para INSERT
-    en sicre_tbl_sig_staging, en el orden de _SICRE_TBL_SIG_COLUMNAS_STAGING.
+    Lee el CSV de "Poblado para credenciales" (delimitador '|', cp1252 --
+    confirmado con el archivo real: los acentos vienen como 0xD3/0xD1/0xC9
+    etc., igual que los CSV de ZAFIRO) y regresa una lista de tuplas listas
+    para INSERT en sicre_tbl_sig_staging, en el orden de
+    _SICRE_TBL_SIG_COLUMNAS_STAGING.
     """
     ahora = timezone.now()
     filas = []
 
-    with open(csv_path, encoding="utf-8", newline="") as f:
+    with open(csv_path, encoding="cp1252", newline="") as f:
         reader = csv.DictReader(f, delimiter="|")
         if not reader.fieldnames:
             raise RuntimeError("El CSV de Poblado para credenciales llegó vacío o sin encabezados.")
