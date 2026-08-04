@@ -1494,6 +1494,7 @@ class CeldaOverride(models.Model):
         ("BAJAS_SIG", "Bajas"),
         ("MOV_POS", "Movimientos Posición"),
         ("CP_TBL_HISTORIAL", "Histórico Movimientos"),
+        ("DATOS_PERSONALES", "Datos Personales"),
     ])
     clave_negocio = models.JSONField()
     clave_negocio_hash = models.CharField(max_length=64, db_index=True)
