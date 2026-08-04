@@ -21,19 +21,20 @@
  *   4. El componente POBLADO.POBLADO_CRED.GBL carga, por analogía directa
  *      con descargarExcel.js/consultas.js, dentro del frame "ptifrmtgtframe"
  *      (mismo frame donde vive el work record ZAFIRO_WRK en index.js).
- *   5. Checkbox "Poblado SQL" = POBLADO_WRK_FLAG (la consulta, preferida sobre
- *      "Poblado Excel" = POBLADO_WRK_FLAG2 porque cada INSERT trae el nombre
- *      de columna junto al valor — no depende de encoding/orden de columnas
- *      como el CSV). "Poblado Excel" viene marcada por defecto, así que se
- *      desmarca explícitamente y se marca solo "Poblado SQL". Botón
- *      "Ejecutar" = POBLADO_WRK_EXECUTE_PB.
- *   6. Confirmado por el usuario: al ejecutar con "Poblado SQL" NO se dispara
- *      una descarga a disco — se abre una pestaña/ventana nueva navegando a
- *      una URL tipo ".../tmpdb/POBLADO_CRED.TXT" con el SQL (DELETE +
- *      INSERTs en sintaxis T-SQL/SQL Server) como texto plano. El script
- *      cambia al handle de esa ventana nueva, lee el texto del body, lo
- *      guarda como poblado_credenciales.sql, cierra esa ventana y regresa a
- *      la principal.
+ *   5. Checkbox "Poblado Excel" = POBLADO_WRK_FLAG2. Se prefiere sobre
+ *      "Poblado SQL" (POBLADO_WRK_FLAG) porque el Excel SÍ trae las columnas
+ *      ESTADO_HUM y ESTADO_NOMINA (el SQL no las trae) — necesarias para
+ *      distinguir personal dado de baja y no perder ese histórico (ej. para
+ *      poder reimprimir una credencial en una recontratación). "Poblado SQL"
+ *      viene marcada por defecto en algunas sesiones, así que se desmarca
+ *      explícitamente y se marca solo "Poblado Excel". Botón "Ejecutar" =
+ *      POBLADO_WRK_EXECUTE_PB.
+ *   6. Confirmado por el usuario: al ejecutar con "Poblado Excel" sí se
+ *      dispara una descarga normal a disco (a diferencia de "Poblado SQL",
+ *      que abre una pestaña nueva con texto plano) — mismo patrón que
+ *      index.js (waitForNewDownload). El archivo resultante es texto
+ *      delimitado por "|" (visto en LibreOffice como CSV, UTF-8), pese al
+ *      nombre "Excel".
  *
  * Si algún paso no calza exactamente con el portal real (ej. el frame no es
  * "ptifrmtgtframe"), el catch de abajo deja un screenshot
@@ -234,52 +235,38 @@ const main = async () => {
     // ---- El componente carga en ptifrmtgtframe (igual que ZAFIRO_WRK) ----
     await switchToWorkFrame(driver, "ptifrmtgtframe", 15000);
 
-    // ---- Checkbox "Poblado SQL" (POBLADO_WRK_FLAG) — queremos SOLO esta
-    // marcada. "Poblado Excel" (POBLADO_WRK_FLAG2) viene marcada por
-    // defecto, así que se desmarca explícitamente primero. ----
-    await driver.wait(until.elementLocated(By.id("POBLADO_WRK_FLAG")), 10000);
+    // ---- Checkbox "Poblado Excel" (POBLADO_WRK_FLAG2) — queremos SOLO esta
+    // marcada. "Poblado SQL" (POBLADO_WRK_FLAG) puede venir marcada de una
+    // sesión previa, así que se desmarca explícitamente primero. ----
+    await driver.wait(until.elementLocated(By.id("POBLADO_WRK_FLAG2")), 10000);
 
     await driver.executeScript(
-      "var excel = document.getElementById('POBLADO_WRK_FLAG2'); if (excel && excel.checked) { excel.click(); }",
+      "var sql = document.getElementById('POBLADO_WRK_FLAG'); if (sql && sql.checked) { sql.click(); }",
     );
     await driver.sleep(300);
 
     await driver.executeScript(
-      "var sql = document.getElementById('POBLADO_WRK_FLAG'); if (sql && !sql.checked) { sql.click(); }",
+      "var excel = document.getElementById('POBLADO_WRK_FLAG2'); if (excel && !excel.checked) { excel.click(); }",
     );
     await driver.sleep(300);
 
-    // ---- Ejecutar. A diferencia de "Poblado Excel", esto NO descarga un
-    // archivo: abre una pestaña/ventana nueva navegando a una URL .TXT con
-    // el SQL (DELETE + INSERTs) como texto plano. Cambiamos a esa ventana,
-    // leemos el texto, lo guardamos, y cerramos esa ventana. ----
-    const ventanasAntes = await driver.getAllWindowHandles();
-
+    // ---- Ejecutar y esperar la descarga automática del navegador --------
+    // Confirmado por el usuario: aparece un loader (~30s o menos) y al
+    // terminar el navegador dispara la descarga solo — igual que index.js.
+    const previos = snapshotArchivos(DOWNLOAD_DIR);
     const btn = await driver.findElement(By.id("POBLADO_WRK_EXECUTE_PB"));
     await driver.executeScript("arguments[0].scrollIntoView(true);", btn);
     await driver.sleep(500);
     await btn.click();
 
-    const ventanaNueva = await esperarVentanaNueva(driver, ventanasAntes, 120000);
-    await driver.switchTo().window(ventanaNueva);
-    await driver.wait(until.elementLocated(By.css("body")), 15000);
-
-    const contenidoSql = await driver.findElement(By.css("body")).getText();
-
-    if (!contenidoSql || !contenidoSql.toLowerCase().includes("insert into")) {
-      throw new Error(
-        "La ventana nueva no contiene el SQL esperado (¿cambió el formato del portal?).",
-      );
-    }
-
-    const nombreFinal = "poblado_credenciales.sql";
-    fs.writeFileSync(path.join(DOWNLOAD_DIR, nombreFinal), contenidoSql, "utf-8");
-    console.log(`Archivo guardado: ${nombreFinal} (${contenidoSql.length} caracteres)`);
-
-    // Cerrar la ventana del texto y regresar a la principal antes de salir.
-    await driver.close();
-    await driver.switchTo().window(ventanasAntes[0]);
-
+    const archivoDescargado = await waitForNewDownload(DOWNLOAD_DIR, previos, 120000);
+    const ext = path.extname(archivoDescargado) || ".csv";
+    const nombreFinal = `poblado_credenciales${ext}`;
+    fs.renameSync(
+      path.join(DOWNLOAD_DIR, archivoDescargado),
+      path.join(DOWNLOAD_DIR, nombreFinal),
+    );
+    console.log(`Archivo guardado: ${nombreFinal}`);
     console.log("Proceso terminado: Poblado para credenciales");
   } catch (error) {
     console.error("Error:", error.message);

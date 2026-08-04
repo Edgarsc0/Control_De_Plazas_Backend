@@ -43,6 +43,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -52,7 +53,7 @@ import requests
 from celery import shared_task
 from celery.utils.log import get_task_logger
 from django.conf import settings
-from django.db import connection, transaction
+from django.db import connection, connections, transaction
 
 from .models import (
     BajasSigHistorico,
@@ -2278,6 +2279,168 @@ def _ejecutar_script_node_generico(
     )
 
 
+# ---------------------------------------------------------------------------
+# Parseo del CSV de "Poblado para credenciales" -> sicre_tbl_sig
+#
+# Encabezados capturados en vivo del portal (2026-08-03), 15 columnas en
+# total -- exactamente los mismos campos de SicreTblSig (modelo del proyecto
+# credencializacionBack) salvo `id` y `fecha_actualizacion`, que esta fuente
+# no trae. Esos dos se dejan sin poblar (NULL / seteado por esta tarea) en
+# vez de alterar el esquema de una tabla que pertenece a otro proyecto.
+# ---------------------------------------------------------------------------
+
+def _normalizar_encabezado_poblado(texto: str) -> str:
+    """Mayúsculas, sin acentos, espacios colapsados -- para matchear encabezados
+    del CSV de forma tolerante a variaciones de acentuación/espaciado."""
+    texto = unicodedata.normalize("NFKD", texto or "").encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"\s+", " ", texto).strip().upper()
+
+
+# encabezado del CSV (normalizado) -> (columna real en sicre_tbl_sig, longitud máxima)
+_POBLADO_CREDENCIALES_MAPA = {
+    _normalizar_encabezado_poblado("EMPLEADO ANAM"): ("EMPLEADO_ANAM", 50),
+    _normalizar_encabezado_poblado("NO EMPLEADO"): ("NO_EMPLEADO", 50),
+    _normalizar_encabezado_poblado("CURP"): ("CURP", 18),
+    _normalizar_encabezado_poblado("NOMBRES"): ("NOMBRES", 150),
+    _normalizar_encabezado_poblado("PRIMER APELLIDO"): ("PRIMER_APELLIDO", 100),
+    _normalizar_encabezado_poblado("SEGUNDO APELLIDO"): ("SEGUNDO_APELLIDO", 100),
+    _normalizar_encabezado_poblado("AREA"): ("AREA", 150),
+    _normalizar_encabezado_poblado("CARGO"): ("CARGO", 150),
+    _normalizar_encabezado_poblado("FECHA EXPEDICION"): ("FECHA_EXPEDICION", None),  # date
+    _normalizar_encabezado_poblado("FIRMA DRH"): ("FIRMA_DRH", 255),
+    _normalizar_encabezado_poblado("CARGO DRH"): ("CARGO_DRH", 255),
+    _normalizar_encabezado_poblado("QR"): ("QR", None),  # TextField
+    _normalizar_encabezado_poblado("ESTATUS"): ("ESTATUS", 100),
+    _normalizar_encabezado_poblado("ESTADO_HUM"): ("ESTADO_HUM", 100),
+    # El CSV la llama "ESTADO_NOMINA"; en sicre_tbl_sig la columna es ESTADO_NOM.
+    _normalizar_encabezado_poblado("ESTADO_NOMINA"): ("ESTADO_NOM", 100),
+}
+
+# Orden fijo de columnas para el INSERT a sicre_tbl_sig_staging (no depende
+# del orden en que vengan las columnas en el CSV). FECHA_ACTUALIZACION no
+# viene del mapa de arriba -- la llena esta tarea con el momento del sync.
+_SICRE_TBL_SIG_COLUMNAS_STAGING = [
+    "EMPLEADO_ANAM", "NO_EMPLEADO", "CURP", "NOMBRES", "PRIMER_APELLIDO",
+    "SEGUNDO_APELLIDO", "AREA", "CARGO", "FECHA_EXPEDICION", "FIRMA_DRH",
+    "CARGO_DRH", "QR", "ESTATUS", "ESTADO_HUM", "ESTADO_NOM", "FECHA_ACTUALIZACION",
+]
+
+
+def _parsear_fecha_poblado_credenciales(valor: str):
+    """'04/01/2026' (MM/DD/YYYY) -> date. None si viene vacío o no parsea."""
+    valor = (valor or "").strip()
+    if not valor:
+        return None
+    try:
+        from datetime import datetime
+        return datetime.strptime(valor, "%m/%d/%Y").date()
+    except ValueError:
+        return None
+
+
+def _leer_csv_poblado_credenciales(csv_path: str, bitacora=None) -> list:
+    """
+    Lee el CSV de "Poblado para credenciales" (delimitador '|', UTF-8 --
+    confirmado al inspeccionar el archivo real, a diferencia de los CSV de
+    ZAFIRO que son cp1252) y regresa una lista de tuplas listas para INSERT
+    en sicre_tbl_sig_staging, en el orden de _SICRE_TBL_SIG_COLUMNAS_STAGING.
+    """
+    ahora = timezone.now()
+    filas = []
+
+    with open(csv_path, encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f, delimiter="|")
+        if not reader.fieldnames:
+            raise RuntimeError("El CSV de Poblado para credenciales llegó vacío o sin encabezados.")
+
+        # Encabezado real del archivo -> (columna BD, longitud máxima)
+        columnas_archivo = {}
+        for encabezado in reader.fieldnames:
+            clave = _normalizar_encabezado_poblado(encabezado)
+            if clave in _POBLADO_CREDENCIALES_MAPA:
+                columnas_archivo[encabezado] = _POBLADO_CREDENCIALES_MAPA[clave]
+
+        columnas_bd_encontradas = {col for col, _ in columnas_archivo.values()}
+        columnas_bd_esperadas = {col for col, _ in _POBLADO_CREDENCIALES_MAPA.values()}
+        faltantes = columnas_bd_esperadas - columnas_bd_encontradas
+        if faltantes:
+            _append_log(
+                bitacora,
+                f"Poblado para credenciales: columnas esperadas no encontradas en el CSV: {', '.join(sorted(faltantes))}",
+                is_error=True,
+            )
+
+        for row in reader:
+            valores = {}
+            for encabezado, (columna_bd, max_len) in columnas_archivo.items():
+                valor = (row.get(encabezado) or "").strip()
+                if columna_bd == "FECHA_EXPEDICION":
+                    valores[columna_bd] = _parsear_fecha_poblado_credenciales(valor)
+                elif not valor:
+                    valores[columna_bd] = None
+                elif max_len:
+                    valores[columna_bd] = valor[:max_len]
+                else:
+                    valores[columna_bd] = valor
+
+            if not valores.get("EMPLEADO_ANAM"):
+                continue  # sin llave primaria, no se puede insertar
+
+            fila = tuple(
+                ahora if col == "FECHA_ACTUALIZACION" else valores.get(col)
+                for col in _SICRE_TBL_SIG_COLUMNAS_STAGING
+            )
+            filas.append(fila)
+
+    _append_log(bitacora, f"Poblado para credenciales: {len(filas)} filas leídas del CSV.")
+    return filas
+
+
+def _cargar_staging_sicre_tbl_sig(filas: list, bitacora=None) -> int:
+    """
+    Crea sicre_tbl_sig_staging si no existe (CREATE TABLE ... LIKE clona el
+    esquema exacto de sicre_tbl_sig automáticamente -- no hay que mantener
+    una lista de columnas duplicada a mano), la trunca, y carga las filas.
+
+    Usa la conexión 'sicre' (ver DATABASES en settings.py), que apunta a
+    sicre_db_backup -- la BD del proyecto credencializacionBack, NO a la BD
+    de este proyecto.
+    """
+    with connections["sicre"].cursor() as cursor:
+        cursor.execute("CREATE TABLE IF NOT EXISTS sicre_tbl_sig_staging LIKE sicre_tbl_sig")
+        cursor.execute("TRUNCATE TABLE sicre_tbl_sig_staging")
+
+        if filas:
+            columnas_sql = ", ".join(f"`{c}`" for c in _SICRE_TBL_SIG_COLUMNAS_STAGING)
+            placeholders = ", ".join(["%s"] * len(_SICRE_TBL_SIG_COLUMNAS_STAGING))
+            cursor.executemany(
+                f"INSERT INTO sicre_tbl_sig_staging ({columnas_sql}) VALUES ({placeholders})",
+                filas,
+            )
+
+    _append_log(bitacora, f"sicre_tbl_sig_staging: {len(filas)} filas cargadas.")
+    return len(filas)
+
+
+def _swap_sicre_tbl_sig(bitacora=None):
+    """
+    Swap atómico entre sicre_tbl_sig (activa, leída en vivo por
+    credencializacionBack) y sicre_tbl_sig_staging -- mismo patrón que
+    _swap_blue_green_tables para las tablas de ZAFIRO. Nunca hay una ventana
+    donde sicre_tbl_sig esté vacía o a medio cargar para quien la esté
+    consultando (búsqueda de empleados, sincronización a Enrolamiento, etc.).
+    """
+    with connections["sicre"].cursor() as cursor:
+        cursor.execute("""
+            RENAME TABLE
+                sicre_tbl_sig TO sicre_tbl_sig_temp,
+                sicre_tbl_sig_staging TO sicre_tbl_sig,
+                sicre_tbl_sig_temp TO sicre_tbl_sig_staging
+        """)
+
+    _append_log(bitacora, "sicre_tbl_sig: swap atómico completado.")
+
+
 @shared_task(
     bind=True,
     name="plantilla.tasks.importar_poblado_credenciales",
@@ -2288,15 +2451,19 @@ def importar_poblado_credenciales(self):
     """
     Tarea Celery independiente para "Poblado para credenciales".
 
-    TODO: en cuanto poblado_credenciales.js tenga la navegación real
-    capturada y sepamos el formato del archivo resultante (CSV/Excel) y la
-    tabla destino, completar aquí el parseo + import (mismo patrón que
-    _importar_csv_* de arriba: staging + bulk_create, o upsert directo si
-    no se justifica un swap Blue-Green para este volumen de datos).
+    Descarga el CSV (checkbox "Poblado Excel" -- preferido sobre "Poblado
+    SQL" porque trae ESTADO_HUM/ESTADO_NOMINA, necesarias para no perder el
+    histórico de personal dado de baja), lo parsea, y actualiza sicre_tbl_sig
+    (BD sicre_db_backup, del proyecto credencializacionBack) con un swap
+    Blue-Green: se carga todo en sicre_tbl_sig_staging primero y solo al
+    final se intercambia atómicamente con la tabla activa, así nunca hay una
+    ventana donde alguien consultando sicre_tbl_sig en vivo (el sistema de
+    credencialización) vea la tabla vacía o a medio cargar.
 
-    Por ahora solo ejecuta el script y deja constancia en el log de Celery
-    de si la descarga se completó, para poder validar el scraping de forma
-    aislada antes de conectar el import a una tabla real.
+    `id` y `fecha_actualizacion` de sicre_tbl_sig no se pueblan desde esta
+    fuente (el CSV no las trae) -- se dejan sin tocar (NULL / seteada por
+    esta tarea, respectivamente) en vez de alterar el esquema de una tabla
+    que pertenece a otro proyecto Django.
     """
     import redis as redis_lib
 
@@ -2331,6 +2498,14 @@ def importar_poblado_credenciales(self):
             )
             return {"status": "skipped", "reason": "script no encontrado"}
 
+        # Limpiar cualquier archivo previo para no leer una copia vieja si el
+        # script llegara a fallar antes de generar uno nuevo.
+        for previo in Path(download_dir).glob("poblado_credenciales.*"):
+            try:
+                previo.unlink()
+            except OSError:
+                pass
+
         resultado = _ejecutar_script_node_generico(script_path, download_dir)
 
         if resultado.returncode != 0:
@@ -2349,10 +2524,32 @@ def importar_poblado_credenciales(self):
             resultado.stdout,
         )
 
-        # TODO: parsear el archivo descargado e importarlo a su tabla destino
-        # una vez que sepamos formato y esquema (ver docstring de la tarea).
+        candidatos = sorted(Path(download_dir).glob("poblado_credenciales.*"))
+        if not candidatos:
+            raise RuntimeError(
+                f"No se encontró poblado_credenciales.* en {download_dir} "
+                "tras ejecutar el script."
+            )
+        ruta_csv = candidatos[0]
 
-        return {"status": "ok", "stdout": resultado.stdout}
+        filas = _leer_csv_poblado_credenciales(str(ruta_csv))
+
+        if not filas:
+            raise RuntimeError(
+                "El CSV de Poblado para credenciales se procesó pero no arrojó "
+                "ninguna fila válida -- se aborta antes de tocar sicre_tbl_sig "
+                "para no dejarla vacía."
+            )
+
+        total_cargado = _cargar_staging_sicre_tbl_sig(filas)
+        _swap_sicre_tbl_sig()
+
+        logger.info(
+            "=== importar_poblado_credenciales completado: %s filas en sicre_tbl_sig ===",
+            total_cargado,
+        )
+
+        return {"status": "ok", "filas": total_cargado}
 
     except Exception as exc:
         logger.error("Error en importar_poblado_credenciales: %s", exc)

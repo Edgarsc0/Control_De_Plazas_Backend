@@ -121,6 +121,28 @@ DATABASES = {
             "write_timeout": 600,
         },
     },
+    # BD del sistema de credencializacion (SICRE/ANAM). sicre_tbl_sig ya existe
+    # ahi, creada y versionada por el proyecto credencializacionBack (Django
+    # aparte) -- aqui NO se corre `migrate` para esta conexion, solo se usa
+    # via SQL crudo (connections['sicre']) para cargar la tabla de staging y
+    # hacer el swap Blue-Green. Ver plantilla/tasks.py:
+    # _cargar_staging_sicre_tbl_sig / _swap_sicre_tbl_sig.
+    "sicre": {
+        "ENGINE": "django.db.backends.mysql",
+        "NAME": os.getenv("DB_SICRE_NAME"),
+        "USER": os.getenv("DB_SICRE_USER"),
+        "PASSWORD": os.getenv("DB_SICRE_PASSWORD"),
+        "HOST": os.getenv("DB_SICRE_HOST", "localhost"),
+        "PORT": os.getenv("DB_SICRE_PORT", "3306"),
+        "CONN_MAX_AGE": 60,
+        "CONN_HEALTH_CHECKS": True,
+        "OPTIONS": {
+            "init_command": "SET sql_mode='STRICT_TRANS_TABLES'",
+            "connect_timeout": 10,
+            "read_timeout": 600,
+            "write_timeout": 600,
+        },
+    },
 }
 
 LOGGING = {
