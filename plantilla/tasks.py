@@ -2442,10 +2442,18 @@ _POBLADO_CREDENCIALES_MAPA = {
 # Orden fijo de columnas para el INSERT a sicre_tbl_sig_staging (no depende
 # del orden en que vengan las columnas en el CSV). FECHA_ACTUALIZACION no
 # viene del mapa de arriba -- la llena esta tarea con el momento del sync.
+#
+# FECHA_PRIMERA_DETECCION es distinta de FECHA_ACTUALIZACION: esta ultima se
+# reescribe en CADA sync para TODOS los empleados (no sirve para saber quien
+# es nuevo). FECHA_PRIMERA_DETECCION se calcula en _leer_csv_poblado_credenciales
+# a partir de lo que ya existia en sicre_tbl_sig antes de este sync -- se
+# preserva para quien ya estaba, se pone "ahora" solo para EMPLEADO_ANAM
+# genuinamente nuevos. Ver _obtener_fechas_primera_deteccion.
 _SICRE_TBL_SIG_COLUMNAS_STAGING = [
     "EMPLEADO_ANAM", "NO_EMPLEADO", "CURP", "NOMBRES", "PRIMER_APELLIDO",
     "SEGUNDO_APELLIDO", "AREA", "CARGO", "FECHA_EXPEDICION", "FIRMA_DRH",
     "CARGO_DRH", "QR", "ESTATUS", "ESTADO_HUM", "ESTADO_NOM", "FECHA_ACTUALIZACION",
+    "FECHA_PRIMERA_DETECCION",
 ]
 
 
@@ -2468,6 +2476,31 @@ def _parsear_fecha_poblado_credenciales(valor: str):
         return None
 
 
+def _obtener_fechas_primera_deteccion(bitacora=None) -> dict:
+    """
+    Lee de la tabla ACTIVA sicre_tbl_sig (antes de tocar staging/swap) el mapa
+    EMPLEADO_ANAM -> fecha en la que se detecto por primera vez.
+
+    Usa COALESCE(FECHA_PRIMERA_DETECCION, FECHA_ACTUALIZACION) porque, para
+    los empleados que ya existian ANTES de agregar esta columna,
+    FECHA_PRIMERA_DETECCION viene NULL -- se usa su FECHA_ACTUALIZACION previa
+    como mejor aproximacion disponible (sera la fecha del ultimo sync antes de
+    este cambio), en vez de dejarlos sin fecha o tratarlos como "nuevos hoy".
+    """
+    mapa = {}
+    with connections["sicre"].cursor() as cursor:
+        cursor.execute("""
+            SELECT EMPLEADO_ANAM, COALESCE(FECHA_PRIMERA_DETECCION, FECHA_ACTUALIZACION)
+            FROM sicre_tbl_sig
+            WHERE EMPLEADO_ANAM IS NOT NULL
+        """)
+        for empleado_anam, fecha in cursor.fetchall():
+            mapa[empleado_anam] = fecha
+
+    _append_log(bitacora, f"sicre_tbl_sig: {len(mapa)} fechas de primera detección recuperadas.")
+    return mapa
+
+
 def _leer_csv_poblado_credenciales(csv_path: str, bitacora=None) -> list:
     """
     Lee el CSV de "Poblado para credenciales" (delimitador '|', cp1252 --
@@ -2475,8 +2508,15 @@ def _leer_csv_poblado_credenciales(csv_path: str, bitacora=None) -> list:
     etc., igual que los CSV de ZAFIRO) y regresa una lista de tuplas listas
     para INSERT en sicre_tbl_sig_staging, en el orden de
     _SICRE_TBL_SIG_COLUMNAS_STAGING.
+
+    FECHA_PRIMERA_DETECCION se calcula aqui mismo: para cada EMPLEADO_ANAM que
+    ya existia (segun `fechas_previas`, leido de sicre_tbl_sig ANTES de este
+    sync), se conserva su fecha ya registrada -- nunca se pisa. Para un
+    EMPLEADO_ANAM que no aparece en `fechas_previas`, es un alta genuina y se
+    marca con `ahora`.
     """
     ahora = timezone.now()
+    fechas_previas = _obtener_fechas_primera_deteccion(bitacora)
     filas = []
 
     with open(csv_path, encoding="cp1252", newline="") as f:
@@ -2514,8 +2554,11 @@ def _leer_csv_poblado_credenciales(csv_path: str, bitacora=None) -> list:
                 else:
                     valores[columna_bd] = valor
 
-            if not valores.get("EMPLEADO_ANAM"):
+            empleado_anam = valores.get("EMPLEADO_ANAM")
+            if not empleado_anam:
                 continue  # sin llave primaria, no se puede insertar
+
+            valores["FECHA_PRIMERA_DETECCION"] = fechas_previas.get(empleado_anam, ahora)
 
             fila = tuple(
                 ahora if col == "FECHA_ACTUALIZACION" else valores.get(col)
@@ -2523,7 +2566,12 @@ def _leer_csv_poblado_credenciales(csv_path: str, bitacora=None) -> list:
             )
             filas.append(fila)
 
-    _append_log(bitacora, f"Poblado para credenciales: {len(filas)} filas leídas del CSV.")
+    nuevos = sum(1 for f in filas if f[-1] == ahora)
+    _append_log(
+        bitacora,
+        f"Poblado para credenciales: {len(filas)} filas leídas del CSV "
+        f"({nuevos} altas nuevas detectadas por FECHA_PRIMERA_DETECCION).",
+    )
     return filas
 
 
