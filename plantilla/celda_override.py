@@ -12,7 +12,7 @@ patrón que `tasks._reaplicar_prioridad_nivel_jerarquico`).
 import hashlib
 import json
 
-from django.db import transaction
+from django.db import connection, transaction
 
 from .models import CeldaOverride, DatosPersonales, EmpleadosCompletosSig, EmpleadosCompletosSigBase
 
@@ -194,17 +194,19 @@ def aplicar_overrides_datos_personales(bitacora=None):
     Reaplica todos los overrides activos de DATOS_PERSONALES sobre la tabla
     recién importada (blue-green swap, ver tasks._swap_blue_green_tables).
     No falla si un `no_empleado` ya no existe — solo lo cuenta como huérfano.
+
+    Delega en el SP `sp_aplicar_overrides_datos_personales` (ya vive en la
+    BD, ver eje_central_back/plantilla/sql/sp_aplicar_overrides_datos_personales.sql):
+    1 UPDATE...JOIN por columna distinta corrido dentro de MySQL, en vez del
+    loop en Python de antes (un UPDATE por override, uno por uno) — contra la
+    BD remota eso tardaba minutos con miles de overrides activos.
     """
-    overrides = CeldaOverride.objects.filter(tabla=TABLA_DATOS_PERSONALES, activo=True)
-    aplicados, huerfanos = 0, 0
     with transaction.atomic():
-        for ov in overrides:
-            no_empleado = ov.clave_negocio.get("no_empleado")
-            updated = DatosPersonales.objects.filter(no_empleado=no_empleado).update(
-                **{ov.columna: ov.valor_nuevo}
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "CALL sp_aplicar_overrides_datos_personales(@aplicados, @huerfanos)"
             )
-            if updated:
-                aplicados += 1
-            else:
-                huerfanos += 1
-    return {"aplicados": aplicados, "huerfanos": huerfanos}
+            cursor.execute("SELECT @aplicados, @huerfanos")
+            aplicados, huerfanos = cursor.fetchone()
+
+    return {"aplicados": aplicados or 0, "huerfanos": huerfanos or 0}
