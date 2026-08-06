@@ -2500,24 +2500,43 @@ def _parsear_fecha_poblado_credenciales(valor: str):
         return None
 
 
+# Marca para empleados que ya estaban en el roster antes de que existiera
+# FECHA_PRIMERA_DETECCION. No se sabe cuando se detectaron, pero SI se sabe que
+# no son altas nuevas, y eso es lo unico que la pestana "Nuevos ingresos hoy"
+# necesita distinguir.
+_FECHA_PREEXISTENTE = "2000-01-01 00:00:00"
+
+
 def _obtener_fechas_primera_deteccion(bitacora=None) -> dict:
     """
     Lee de la tabla ACTIVA sicre_tbl_sig (antes de tocar staging/swap) el mapa
     EMPLEADO_ANAM -> fecha en la que se detecto por primera vez.
 
-    Usa COALESCE(FECHA_PRIMERA_DETECCION, FECHA_ACTUALIZACION) porque, para
-    los empleados que ya existian ANTES de agregar esta columna,
-    FECHA_PRIMERA_DETECCION viene NULL -- se usa su FECHA_ACTUALIZACION previa
-    como mejor aproximacion disponible (sera la fecha del ultimo sync antes de
-    este cambio), en vez de dejarlos sin fecha o tratarlos como "nuevos hoy".
+    El respaldo cuando FECHA_PRIMERA_DETECCION viene NULL es una fecha FIJA en
+    el pasado, NO FECHA_ACTUALIZACION.
+
+    Respaldar contra FECHA_ACTUALIZACION parecia razonable ("la fecha del
+    ultimo sync") y era lo que se hacia antes, pero esta mal: esa columna se
+    reescribe a `ahora` para TODAS las filas en CADA sync, asi que no conserva
+    ninguna historia. Al leerla, el roster entero aparecia detectado hace
+    minutos y la pestana "Nuevos ingresos hoy" marcaba las 16 431 filas como
+    altas del dia. Comprobado en la BD real: las 16 431 quedaron con el mismo
+    timestamp exacto, el del sync.
+
+    Lo unico que hace falta distinguir aqui es "ya estaba en la tabla" contra
+    "no estaba": lo primero nunca es un alta nueva, sin importar cuando haya
+    ocurrido.
     """
     mapa = {}
     with connections["sicre"].cursor() as cursor:
-        cursor.execute("""
-            SELECT EMPLEADO_ANAM, COALESCE(FECHA_PRIMERA_DETECCION, FECHA_ACTUALIZACION)
+        cursor.execute(
+            """
+            SELECT EMPLEADO_ANAM, COALESCE(FECHA_PRIMERA_DETECCION, %s)
             FROM sicre_tbl_sig
             WHERE EMPLEADO_ANAM IS NOT NULL
-        """)
+            """,
+            [_FECHA_PREEXISTENTE],
+        )
         for empleado_anam, fecha in cursor.fetchall():
             mapa[empleado_anam] = fecha
 
@@ -2605,9 +2624,11 @@ def _cargar_staging_sicre_tbl_sig(filas: list, bitacora=None) -> int:
     esquema exacto de sicre_tbl_sig automáticamente -- no hay que mantener
     una lista de columnas duplicada a mano), la trunca, y carga las filas.
 
-    Usa la conexión 'sicre' (ver DATABASES en settings.py), que apunta a
-    sicre_db_backup -- la BD del proyecto credencializacionBack, NO a la BD
-    de este proyecto.
+    Usa la conexión 'sicre' (ver DATABASES en settings.py), que apunta a la
+    BD del proyecto credencializacionBack -- NO a la de este proyecto. Cuál
+    BD concreta es lo decide DB_SICRE_NAME en el .env (sicre_db en
+    producción, sicre_db_backup en pruebas): no hay ningún nombre de BD
+    escrito en el código, así que cambiar de entorno es cambiar esa variable.
     """
     with connections["sicre"].cursor() as cursor:
         cursor.execute("CREATE TABLE IF NOT EXISTS sicre_tbl_sig_staging LIKE sicre_tbl_sig")
@@ -2657,7 +2678,8 @@ def importar_poblado_credenciales(self):
     Descarga el CSV (checkbox "Poblado Excel" -- preferido sobre "Poblado
     SQL" porque trae ESTADO_HUM/ESTADO_NOMINA, necesarias para no perder el
     histórico de personal dado de baja), lo parsea, y actualiza sicre_tbl_sig
-    (BD sicre_db_backup, del proyecto credencializacionBack) con un swap
+    (BD del proyecto credencializacionBack, la que indique DB_SICRE_NAME)
+    con un swap
     Blue-Green: se carga todo en sicre_tbl_sig_staging primero y solo al
     final se intercambia atómicamente con la tabla activa, así nunca hay una
     ventana donde alguien consultando sicre_tbl_sig en vivo (el sistema de
